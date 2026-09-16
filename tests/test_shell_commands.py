@@ -6,7 +6,7 @@ sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 import pytest
 
-from stack_pr.shell_commands import run_shell_command
+from pstack_pr.shell_commands import run_shell_command
 
 
 def test_cmd_success_quiet_false_print(capfd: pytest.CaptureFixture) -> None:

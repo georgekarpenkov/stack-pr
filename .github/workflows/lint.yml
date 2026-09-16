@@ -1,15 +1,16 @@
-name: Lint and check
+name: Lint and type-check
 on: [ pull_request ]
 jobs:
-  ruff:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-      
-      # Run ruff linter
-      - uses: chartboost/ruff-action@e18ae971ccee1b2d7bbef113930f00c670b78da4 # v1
-      
-      # Run ruff format
-      - uses: chartboost/ruff-action@e18ae971ccee1b2d7bbef113930f00c670b78da4 # v1
+      - uses: astral-sh/setup-uv@v6
         with:
-          args: 'format --check'
+          enable-cache: true
+      - name: ruff check
+        run: uv run --frozen ruff check .
+      - name: ruff format
+        run: uv run --frozen ruff format --check .
+      - name: mypy
+        run: uv run --frozen mypy

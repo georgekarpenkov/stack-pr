@@ -1,7 +1,7 @@
-# stack-pr: a tool for working with stacked PRs on github.
+# pstack-pr: a tool for working with stacked PRs on github.
 #
 # ---------------
-# stack-pr submit
+# pstack-pr submit
 # ---------------
 #
 # Semantics:
@@ -22,7 +22,7 @@
 # the first PR in the stack.
 #
 # -------------
-# stack-pr land
+# pstack-pr land
 # -------------
 #
 # Semantics:
@@ -37,7 +37,7 @@
 # all the corresponding remote and local branches deleted.
 #
 # ----------------
-# stack-pr abandon
+# pstack-pr abandon
 # ----------------
 #
 # Semantics:
@@ -63,7 +63,7 @@ from pathlib import Path
 from re import Pattern
 from subprocess import SubprocessError
 
-from stack_pr.git import (
+from pstack_pr.git import (
     branch_exists,
     check_gh_installed,
     get_current_branch_name,
@@ -72,7 +72,7 @@ from stack_pr.git import (
     get_uncommitted_changes,
     is_rebase_in_progress,
 )
-from stack_pr.shell_commands import (
+from pstack_pr.shell_commands import (
     get_command_output,
     run_shell_command,
 )
@@ -193,22 +193,22 @@ Please complete or abort the current rebase first.
 """
 ERROR_CONFIG_INVALID_FORMAT = """Invalid config format.
 
-Usage: stack-pr config <section>.<key>=<value>
+Usage: pstack-pr config <section>.<key>=<value>
 
 Examples:
-  stack-pr config common.verbose=True
-  stack-pr config repo.target=main
-  stack-pr config repo.reviewer=user1,user2
+  pstack-pr config common.verbose=True
+  pstack-pr config repo.target=main
+  pstack-pr config repo.reviewer=user1,user2
 """
 ERROR_TARGET_BRANCH_MASTER_INSTEAD_OF_MAIN = """Could not find target branch '{remote}/{target}'.
 
 It looks like your repository uses '{remote}/master' instead of '{remote}/main'.
 
 You can fix this by specifying the target branch:
-  stack-pr view --target=master
+  pstack-pr view --target=master
 
 Or set it permanently in your config file:
-  stack-pr config repo.target=master
+  pstack-pr config repo.target=master
 """
 ERROR_TARGET_BRANCH_MISSING = """Could not find target branch '{remote}/{target}'.
 
@@ -216,17 +216,17 @@ Make sure the branch exists or specify a different target with --target option.
 """
 UPDATE_STACK_TIP = """
 If you'd like to push your local changes first, you can use the following command to update the stack:
-  $ stack-pr export -B {top_commit}~{stack_size} -H {top_commit}"""
+  $ pstack-pr export -B {top_commit}~{stack_size} -H {top_commit}"""
 EXPORT_STACK_TIP = """
 You can use the following command to do that:
-  $ stack-pr export -B {top_commit}~{stack_size} -H {top_commit}
+  $ pstack-pr export -B {top_commit}~{stack_size} -H {top_commit}
 """
 LAND_STACK_TIP = """
 To land it, you could run:
-  $ stack-pr land -B {top_commit}~{stack_size} -H {top_commit}
+  $ pstack-pr land -B {top_commit}~{stack_size} -H {top_commit}
 
 If you'd like to land stack except the top N commits, you could use the following command:
-  $ stack-pr land -B {top_commit}~{stack_size} -H {top_commit}~N
+  $ pstack-pr land -B {top_commit}~{stack_size} -H {top_commit}~N
 
 If you prefer to merge via the github web UI, please don't forget to edit commit message on the merge page!
 If you use the default commit message filled by the web UI, links to other PRs from the stack will be included in the commit message.
@@ -1567,7 +1567,7 @@ def create_argparser(
     common_parser.add_argument(
         "--branch-name-template",
         default=config.get("repo", "branch_name_template", fallback="$USERNAME/stack"),
-        help="A template for names of the branches stack-pr would use.",
+        help="A template for names of the branches pstack-pr would use.",
     )
     common_parser.add_argument(
         "--show-tips",
@@ -1655,7 +1655,7 @@ def load_config(config_file: str | Path) -> configparser.ConfigParser:
 
 
 def main() -> None:  # noqa: PLR0912
-    repo_config_file = get_repo_root() / ".stack-pr.cfg"
+    repo_config_file = get_repo_root() / ".pstack-pr.cfg"
     config_file = os.getenv("STACKPR_CONFIG", repo_config_file)
     config = load_config(config_file)
 
@@ -1667,7 +1667,7 @@ def main() -> None:  # noqa: PLR0912
         set_verbose(args.verbose)
 
     if not args.command:
-        print(h(red("Invalid usage of the stack-pr command.")))
+        print(h(red("Invalid usage of the pstack-pr command.")))
         parser.print_help()
         return
 

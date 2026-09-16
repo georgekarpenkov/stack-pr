@@ -6,14 +6,14 @@ sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 import pytest
 
-from stack_pr.cli import (
+from pstack_pr.cli import (
     generate_available_branch_name,
     generate_branch_name,
     get_branch_id,
     get_gh_username,
     get_taken_branch_ids,
 )
-from stack_pr.git import git_config, is_rebase_in_progress
+from pstack_pr.git import git_config, is_rebase_in_progress
 
 
 @pytest.fixture(scope="module")

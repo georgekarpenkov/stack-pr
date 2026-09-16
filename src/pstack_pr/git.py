@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from stack_pr.shell_commands import get_command_output, run_shell_command
+from pstack_pr.shell_commands import get_command_output, run_shell_command
 
 
 class GitError(Exception):
