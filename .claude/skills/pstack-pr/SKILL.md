@@ -14,7 +14,7 @@ the index; the only local write is one atomic move of the current branch.
 Use whichever form is available:
 
 - `pstack-pr export ...` (installed with `uv tool install`)
-- `uvx --from git+https://github.com/georgekarpenkov/stack-pr pstack-pr export ...`
+- `uvx --from git+https://github.com/georgekarpenkov/stack-pr@v0.2.1 pstack-pr export ...`
 
 ## Check prerequisites
 
@@ -43,10 +43,11 @@ existing `#N`, and any `retarget` or `move` lines. Then run:
 pstack-pr export
 ```
 
-Report the final `Exported N pull requests:` block with its URLs. Useful flags:
-`--draft`, `--reviewer alice,bob`, `--keep-body` (keep hand-edited PR
-descriptions), `-B`/`-H` for a sub-range, `-v` to print every git and gh
-command.
+Report the final `Exported N pull requests (...)` block: one line per PR with
+`new`/`updated`/`unchanged` and its URL, plus the `Branches pushed:` line.
+Useful flags: `--draft`, `--reviewer alice,bob`, `--keep-body` (keep
+hand-edited PR descriptions), `-B`/`-H` for a sub-range, `-v` to see the plan
+and each step as it runs, `-vv` to also print every git and gh command.
 
 ## Read the output
 
@@ -67,9 +68,19 @@ Plan:
 Dry run: nothing was changed.
 ```
 
-`Everything is up to date; nothing to do.` means a re-run would make no
-writes. `(recovered)` after a title means an interrupted run already pushed
-that commit; it is reused, not duplicated.
+A real run prints only the result:
+
+```
+Exported 3 pull requests (1 new, 1 updated, 1 unchanged):
+   3  #13  new        https://github.com/o/r/pull/13  Add c
+   2  #12  updated    https://github.com/o/r/pull/12  Add b
+   1  #11  unchanged  https://github.com/o/r/pull/11  Add a
+Branches pushed: alice/stack/3 (new), alice/stack/2 (updated)
+```
+
+`Up to date: N pull requests, nothing to push.` means the run made no writes.
+`(recovered)` after a title in the dry-run table means an interrupted run
+already pushed that commit; it is reused, not duplicated.
 
 ## Update a stack
 

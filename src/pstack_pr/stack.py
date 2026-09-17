@@ -85,6 +85,20 @@ class StackEntry:
     tmp_draft: bool = False  # PR was marked draft by us for the transient state
     new_sha: str | None = None  # the rewritten commit, once created
     will_rewrite: bool = False  # decided during planning
+    branch_existed: bool = True  # was ``branch`` on the remote before this run
+    # What this run did, for the final report.
+    created: bool = False  # pull request created by this run
+    pr_edited: bool = False  # pull request title/body/base/draft state changed
+    branch_pushed: bool = False  # remote branch moved by this run
+
+    @property
+    def status(self) -> str:
+        """``new``, ``updated`` or ``unchanged``: what this run did to the PR."""
+        if self.created:
+            return "new"
+        if self.branch_pushed or self.pr_edited:
+            return "updated"
+        return "unchanged"
 
     @property
     def has_pr(self) -> bool:

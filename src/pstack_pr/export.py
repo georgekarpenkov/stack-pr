@@ -28,6 +28,7 @@ the remote side.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -168,6 +169,7 @@ class ResetBases(Step):
                     body = e.pr.body.rstrip() + "\n\n" + TMP_DRAFT_MARKER
             gh.edit_pr(e.pr.number, base=target, body=body)
             e.pr.base = target
+            e.pr_edited = True
             if body is not None:
                 e.pr.body = body
 
@@ -198,6 +200,7 @@ class PushOriginals(Step):
         self.ctx.git.push(self.ctx.opts.remote, refs)
         for e in self.entries:
             e.remote_sha = e.commit.sha
+            e.branch_pushed = True
 
 
 class CreatePullRequest(Step):
@@ -226,6 +229,7 @@ class CreatePullRequest(Step):
             draft=opts.draft,
             reviewers=opts.reviewers,
         )
+        e.created = True
 
 
 class RewriteCommits(Step):
@@ -317,6 +321,7 @@ class PushRewritten(Step):
         self.ctx.git.push(self.ctx.opts.remote, refs)
         for e in self._entries():
             e.remote_sha = e.new_sha or e.commit.sha
+            e.branch_pushed = True
 
 
 class UpdatePullRequest(Step):
@@ -385,6 +390,7 @@ class UpdatePullRequest(Step):
                 body=changes.get("body"),
                 base=changes.get("base"),
             )
+            e.pr_edited = True
             e.pr.title = changes.get("title") or e.pr.title
             e.pr.body = changes.get("body") or e.pr.body
             e.pr.base = changes.get("base") or e.pr.base
@@ -393,6 +399,7 @@ class UpdatePullRequest(Step):
                 gh.set_draft(e.pr.number, draft=False)
             e.pr.is_draft = False
             e.tmp_draft = False
+            e.pr_edited = True
 
 
 # --------------------------------------------------------------------------- #
@@ -458,7 +465,7 @@ class Plan:
         for warning in self.warnings:
             ui.warn(warning)
 
-    def execute(self, ui: UI) -> None:
+    def execute(self, ui: UI, *, show_progress: bool = False) -> None:
         total = sum(len(lines) for _, lines in self.active_steps())
         n = 0
         for step in self.steps:
@@ -468,21 +475,43 @@ class Plan:
                 continue
             for line in lines:
                 n += 1
-                ui.info(f"  {ui.dim(f'[{n}/{total}]')} {line}")
-            step.run()
+                if show_progress:
+                    ui.info(f"  {ui.dim(f'[{n}/{total}]')} {line}")
+            try:
+                step.run()
+            except Exception:
+                if not show_progress:
+                    ui.warn("failed while trying to: " + "; ".join(lines))
+                raise
 
     def print_result(self, ui: UI) -> None:
+        """The outcome: one line per pull request, plus the branches pushed."""
         entries = self.ctx.entries
-        ui.info()
-        ui.header(
-            f"Exported {len(entries)} pull request{'s' if len(entries) != 1 else ''}:"
-        )
+        counts = Counter(e.status for e in entries)
+        n = len(entries)
+        noun = f"pull request{'s' if n != 1 else ''}"
+        if counts["unchanged"] == n:
+            ui.header(f"Up to date: {n} {noun}, nothing to push.")
+        else:
+            summary = ", ".join(
+                f"{counts[k]} {k}" for k in ("new", "updated", "unchanged") if counts[k]
+            )
+            ui.header(f"Exported {n} {noun} ({summary}):")
+        colors = {"new": ui.green, "updated": ui.cyan, "unchanged": ui.dim}
         width = max(len(f"#{e.pr.number}") for e in entries if e.pr is not None)
         for e in reversed(entries):
             assert e.pr is not None  # noqa: S101
             label = f"#{e.pr.number}"
-            label = ui.cyan(label) + " " * (width - len(label))
-            ui.info(f"  {e.index + 1:>2}  {label}  {e.pr.url}  {pr_title(e)}")
+            label = ui.bold(label) + " " * (width - len(label))
+            status = colors[e.status](e.status) + " " * (9 - len(e.status))
+            ui.info(f"  {e.index + 1:>2}  {label}  {status}  {e.pr.url}  {pr_title(e)}")
+        pushed = [e for e in entries if e.branch_pushed]
+        if pushed:
+            parts = [
+                f"{e.branch} ({'new' if not e.branch_existed else 'updated'})"
+                for e in pushed
+            ]
+            ui.info("Branches pushed: " + ", ".join(parts))
 
 
 # --------------------------------------------------------------------------- #
@@ -579,6 +608,8 @@ def _assign_branches(ctx: Context, template: BranchTemplate) -> None:
             e.remote_sha = remote_branches[e.branch]
         else:
             e.remote_sha = git.for_each_ref(prefix + e.branch).get(prefix + e.branch)
+    for e in stack.entries:
+        e.branch_existed = e.remote_sha is not None
 
 
 def _pr_number(entry: StackEntry, repo: Repo) -> int:
@@ -679,6 +710,7 @@ def plan_export(
     ui: UI,
     *,
     github_factory: GitHubFactory = GitHub,
+    show_progress: bool = False,
 ) -> Plan:
     if git.rebase_in_progress():
         raise PstackError("a rebase is in progress; finish or abort it first")
@@ -686,7 +718,8 @@ def plan_export(
     repo = parse_remote_url(git.remote_url(opts.remote))
     gh = github_factory(repo)
 
-    ui.info(ui.dim(f"Fetching {opts.remote}..."))
+    if show_progress:
+        ui.info(ui.dim(f"Fetching {opts.remote}..."))
     git.fetch(opts.remote)
 
     base_sha, head_sha, stack = _read_stack(git, opts)

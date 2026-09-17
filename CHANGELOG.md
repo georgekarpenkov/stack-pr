@@ -1,5 +1,13 @@
 # Top of tree
 
+# Version 0.2.1
+
+* `export` is quiet by default: it prints only the result, one line per pull
+  request marked `new`, `updated` or `unchanged`, plus the branches pushed.
+  `-v` shows the plan and each step as it runs (what used to be the default);
+  `-vv` also logs every `git` and `gh` command (what `-v` used to do).
+* Installation instructions pin the release tag.
+
 # Version 0.2.0
 
 * Renamed the project to `pstack-pr`: the package is `pstack-pr`, the module

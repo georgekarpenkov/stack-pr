@@ -24,6 +24,20 @@ def plan_lines(out: str) -> list[str]:
     return [m.group(1) for line in out.splitlines() if (m := PLAN_LINE_RE.match(line))]
 
 
+def result_block(out: str) -> list[str]:
+    """The result block: from the ``Exported``/``Up to date`` header to the end."""
+    lines = out.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith(("Exported ", "Up to date: ")):
+            return lines[i:]
+    raise AssertionError(f"no result block in:\n{out}")
+
+
+def result_line(index: int, number: int, status: str, title: str) -> str:
+    """One entry of the result block; ``status`` is padded to 9 columns."""
+    return f"  {index:>2}  #{number}  {status:<9}  {REPO_URL}/pull/{number}  {title}"
+
+
 def stack_info(number: int, branch: str | None = None) -> str:
     branch = branch or f"testbot/stack/{number}"
     return f"stack-info: PR: {REPO_URL}/pull/{number}, branch: {branch}"
@@ -272,21 +286,65 @@ def test_fresh_export_gh_calls_create_each_pr_once_and_edit_it_once(
     assert fake_gh.write_calls() == creates + edits
 
 
-def test_fresh_export_prints_progress_and_summary_with_urls(
+def test_fresh_export_prints_only_the_result_block_by_default(
     work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
 ) -> None:
     rc, out, err = run_export()
 
     assert rc == 0
     assert err == ""
-    assert "Fetching origin..." in out
-    assert "Plan:" in out
-    assert "[1/10] push to origin:" in out
-    assert "[10/10] update PR #3: body (cross-links)" in out
-    assert "Exported 3 pull requests:" in out
-    assert f"   3  #3  {REPO_URL}/pull/3  Add c" in out
-    assert f"   2  #2  {REPO_URL}/pull/2  Add b" in out
-    assert f"   1  #1  {REPO_URL}/pull/1  Add a" in out
+    # No fetch notice, stack table, plan or progress lines: just the outcome.
+    assert out == (
+        "Exported 3 pull requests (3 new):\n"
+        f"   3  #3  new        {REPO_URL}/pull/3  Add c\n"
+        f"   2  #2  new        {REPO_URL}/pull/2  Add b\n"
+        f"   1  #1  new        {REPO_URL}/pull/1  Add a\n"
+        "Branches pushed: testbot/stack/1 (new), testbot/stack/2 (new), "
+        "testbot/stack/3 (new)\n"
+    )
+
+
+def test_fresh_export_verbose_prints_fetch_stack_plan_progress_then_result(
+    work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    a, b, c = stack3
+
+    rc, out, err = run_export("-v")
+
+    assert rc == 0
+    assert err == ""
+    lines = out.splitlines()
+    assert lines[0] == "Fetching origin..."
+    assert lines[1] == (
+        "Stack of 3 commits on feature "
+        f"(base: origin/main @ {work.head('origin/main')[:8]})"
+    )
+    assert lines[2:7] == [
+        f"   3  {c[:8]}  new PR  testbot/stack/3  Add c",
+        f"   2  {b[:8]}  new PR  testbot/stack/2  Add b",
+        f"   1  {a[:8]}  new PR  testbot/stack/1  Add a",
+        "",
+        "Plan:",
+    ]
+    assert len(plan_lines(out)) == 10
+    assert lines[7].startswith("   1. push to origin: ")
+    assert lines[16] == f"  10. update the new PR for {c[:8]}: body (cross-links)"
+    assert lines[17] == ""
+    assert lines[18].startswith("  [1/10] push to origin: ")
+    assert lines[19] == f"  [2/10] create PR for {a[:8]}: testbot/stack/1 -> main"
+    # Progress is described at execution time, when the PR numbers are known.
+    assert lines[27] == "  [10/10] update PR #3: body (cross-links)"
+    assert lines[28] == ""
+    assert lines[29:] == [
+        "Exported 3 pull requests (3 new):",
+        result_line(3, 3, "new", "Add c"),
+        result_line(2, 2, "new", "Add b"),
+        result_line(1, 1, "new", "Add a"),
+        (
+            "Branches pushed: testbot/stack/1 (new), testbot/stack/2 (new), "
+            "testbot/stack/3 (new)"
+        ),
+    ]
     assert "Dry run" not in out
 
 
@@ -303,15 +361,22 @@ def test_reexport_without_changes_is_a_no_op(
     prs = fake_gh.prs()
     reflog = work.reflog("feature")
 
-    rc, out, err = run_export()
+    rc, out, err = run_export("-v")
 
     assert rc == 0
     assert err == ""
     assert "Everything is up to date; nothing to do." in out
     assert "Plan:" not in out
     assert "Exported" not in out
-    assert out.count("#1") == 1  # the stack table lists the existing PRs
-    assert "  #3  testbot/stack/3  Add c" in out
+    assert "  #3  testbot/stack/3  Add c" in out  # the stack table lists the PRs
+    assert not any(re.match(r"^\s*\[\d+/\d+\]", line) for line in out.splitlines())
+    assert result_block(out) == [
+        "Up to date: 3 pull requests, nothing to push.",
+        result_line(3, 3, "unchanged", "Add c"),
+        result_line(2, 2, "unchanged", "Add b"),
+        result_line(1, 1, "unchanged", "Add a"),
+    ]
+    assert out.count("#1") == 2  # once in the stack table, once in the result
     assert work.head() == head
     assert work.remote.branches() == branches
     assert fake_gh.write_calls() == write_calls
@@ -320,6 +385,23 @@ def test_reexport_without_changes_is_a_no_op(
     # The second run only read: one user lookup and one view per PR.
     assert len(fake_gh.calls("pr", "view")) == 3
     assert fake_gh.calls("pr", "list") == []
+
+
+def test_reexport_without_changes_prints_only_up_to_date_by_default(
+    work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    run_export()
+
+    rc, out, err = run_export()
+
+    assert rc == 0
+    assert err == ""
+    assert out == (
+        "Up to date: 3 pull requests, nothing to push.\n"
+        f"   3  #3  unchanged  {REPO_URL}/pull/3  Add c\n"
+        f"   2  #2  unchanged  {REPO_URL}/pull/2  Add b\n"
+        f"   1  #1  unchanged  {REPO_URL}/pull/1  Add a\n"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -342,7 +424,7 @@ def test_amending_middle_commit_content_only_pushes_branches_above_it(
     a2, b2, c2 = work.shas()
     assert (a2, b2) == (a1, new_b)
 
-    rc, out, _err = run_export()
+    rc, out, _err = run_export("-v")
 
     assert rc == 0
     assert plan_lines(out) == [
@@ -353,6 +435,13 @@ def test_amending_middle_commit_content_only_pushes_branches_above_it(
     ]
     assert "rewrite" not in out
     assert "update PR" not in out
+    assert result_block(out) == [
+        "Exported 3 pull requests (2 updated, 1 unchanged):",
+        result_line(3, 3, "updated", "Add c"),
+        result_line(2, 2, "updated", "Add b"),
+        result_line(1, 1, "unchanged", "Add a"),
+        "Branches pushed: testbot/stack/2 (updated), testbot/stack/3 (updated)",
+    ]
     # Nothing was rewritten locally: the commits are exactly the rebased ones.
     assert work.shas() == [a2, b2, c2]
     assert work.messages() == messages_before
@@ -386,12 +475,19 @@ def test_rewording_top_commit_title_updates_its_pr_title(
     reworded = work.head()
     assert work.message() == new_message
 
-    rc, out, _err = run_export()
+    rc, out, _err = run_export("-v")
 
     assert rc == 0
     assert plan_lines(out) == [
         "push the stack to origin (--atomic --force-with-lease): testbot/stack/3",
         "update PR #3: title, body (cross-links)",
+    ]
+    assert result_block(out) == [
+        "Exported 3 pull requests (1 updated, 2 unchanged):",
+        result_line(3, 3, "updated", "Add c (reworded)"),
+        result_line(2, 2, "unchanged", "Add b"),
+        result_line(1, 1, "unchanged", "Add a"),
+        "Branches pushed: testbot/stack/3 (updated)",
     ]
     assert work.head() == reworded  # nothing to rewrite: stack-info still valid
     prs = fake_gh.prs()
@@ -431,7 +527,7 @@ def test_inserting_commit_between_a_and_b_relinks_bases(
     trees_before = [work.tree(s) for s in rebased]
     identities_before = identities(work)
 
-    rc, out, _err = run_export()
+    rc, out, _err = run_export("-v")
 
     assert rc == 0
     assert plan_lines(out) == [
@@ -454,7 +550,18 @@ def test_inserting_commit_between_a_and_b_relinks_bases(
         "update PR #2: base -> testbot/stack/4, body (cross-links)",
         "update PR #3: body (cross-links)",
     ]
-    assert "Exported 4 pull requests:" in out
+    # #1 is "updated" although its branch stayed put: its cross-links changed.
+    assert result_block(out) == [
+        "Exported 4 pull requests (1 new, 3 updated):",
+        result_line(4, 3, "updated", "Add c"),
+        result_line(3, 2, "updated", "Add b"),
+        result_line(2, 4, "new", "Add a2"),
+        result_line(1, 1, "updated", "Add a"),
+        (
+            "Branches pushed: testbot/stack/4 (new), testbot/stack/2 (updated), "
+            "testbot/stack/3 (updated)"
+        ),
+    ]
 
     prs = fake_gh.prs()
     assert sorted(prs) == [1, 2, 3, 4]
@@ -505,7 +612,7 @@ def test_head_option_exports_partial_stack_and_reparents_commits_above(
     a, b, c = stack3
     identities_before = identities(work)
 
-    rc, out, _err = run_export("-H", "HEAD~1")
+    rc, out, _err = run_export("-v", "-H", "HEAD~1")
 
     assert rc == 0
     assert "Stack of 2 commits on feature" in out
@@ -515,7 +622,12 @@ def test_head_option_exports_partial_stack_and_reparents_commits_above(
         "contents, authors and dates are unchanged), then re-parent the 1 commit "
         "above the stack"
     ) in plan_lines(out)
-    assert "Exported 2 pull requests:" in out
+    assert result_block(out) == [
+        "Exported 2 pull requests (2 new):",
+        result_line(2, 2, "new", "Add b"),
+        result_line(1, 1, "new", "Add a"),
+        "Branches pushed: testbot/stack/1 (new), testbot/stack/2 (new)",
+    ]
     assert sorted(fake_gh.prs()) == [1, 2]
     assert fake_gh.pr(2)["title"] == "Add b"
     assert sorted(work.remote.branches()) == [
@@ -547,11 +659,18 @@ def test_plain_export_after_partial_export_adds_pr_for_the_top_commit(
     branches_before = work.remote.branches()
     prs_before = fake_gh.prs()
 
-    rc, out, _err = run_export()
+    rc, out, _err = run_export("-v")
 
     assert rc == 0
     assert out.count("  new PR  ") == 1
-    assert "Exported 3 pull requests:" in out
+    # #1 and #2 gain a cross-link to #3, so they count as updated.
+    assert result_block(out) == [
+        "Exported 3 pull requests (1 new, 2 updated):",
+        result_line(3, 3, "new", "Add c"),
+        result_line(2, 2, "updated", "Add b"),
+        result_line(1, 1, "updated", "Add a"),
+        "Branches pushed: testbot/stack/3 (new)",
+    ]
     prs = fake_gh.prs()
     assert sorted(prs) == [1, 2, 3]
     assert prs[3]["title"] == "Add c"
@@ -586,10 +705,16 @@ def test_base_option_exports_only_commits_above_it_with_target_as_first_base(
 ) -> None:
     a, b, c = stack3
 
-    rc, out, _err = run_export("-B", "HEAD~2")
+    rc, out, _err = run_export("-v", "-B", "HEAD~2")
 
     assert rc == 0
     assert "Stack of 2 commits on feature" in out
+    assert result_block(out) == [
+        "Exported 2 pull requests (2 new):",
+        result_line(2, 2, "new", "Add c"),
+        result_line(1, 1, "new", "Add b"),
+        "Branches pushed: testbot/stack/1 (new), testbot/stack/2 (new)",
+    ]
     assert f"create PR for {b[:8]}: testbot/stack/1 -> main" in plan_lines(out)
     assert f"create PR for {c[:8]}: testbot/stack/2 -> testbot/stack/1" in plan_lines(
         out
@@ -632,7 +757,7 @@ def test_detached_head_is_moved_and_branch_is_left_alone(
     work.git("checkout", "-q", "--detach")
     assert work.git("symbolic-ref", "-q", "HEAD", check=False) == ""
 
-    rc, out, _err = run_export()
+    rc, out, _err = run_export("-v")
 
     assert rc == 0
     assert "Stack of 3 commits on HEAD (detached)" in out
@@ -640,7 +765,7 @@ def test_detached_head_is_moved_and_branch_is_left_alone(
         f"move HEAD (detached) from {c[:8]} to the rewritten tip "
         f"(git update-ref, only if it is still at {c[:8]})"
     ) in plan_lines(out)
-    assert "Exported 3 pull requests:" in out
+    assert result_block(out)[0] == "Exported 3 pull requests (3 new):"
     assert work.git("symbolic-ref", "-q", "HEAD", check=False) == ""  # still detached
     assert work.head("feature") == c
     assert work.head() != c
@@ -659,7 +784,7 @@ def test_single_commit_stack_has_plain_body_and_no_edit(
 ) -> None:
     work.commit("a.txt", "Add a\n\nSome details about a.")
 
-    rc, out, _err = run_export()
+    rc, out, _err = run_export("-v")
 
     assert rc == 0
     assert "Stack of 1 commit on feature" in out
@@ -677,7 +802,11 @@ def test_single_commit_stack_has_plain_body_and_no_edit(
         "push the stack to origin (--atomic --force-with-lease): testbot/stack/1",
     ]
     assert not any(line.startswith("update") for line in plan_lines(out))
-    assert "Exported 1 pull request:" in out
+    assert result_block(out) == [
+        "Exported 1 pull request (1 new):",
+        result_line(1, 1, "new", "Add a"),
+        "Branches pushed: testbot/stack/1 (new)",
+    ]
     prs = fake_gh.prs()
     assert list(prs) == [1]
     assert prs[1]["body"] == "Some details about a."
@@ -709,7 +838,7 @@ def test_draft_and_reviewers_are_passed_to_pr_create(
 ) -> None:
     a = stack3[0]
 
-    rc, out, _err = run_export("--draft", "--reviewer", "alice,bob")
+    rc, out, _err = run_export("-v", "--draft", "--reviewer", "alice,bob")
 
     assert rc == 0
     assert (
@@ -806,10 +935,14 @@ TEMPLATE = "wip/$BRANCH/$ID-$USERNAME"
 def test_branch_name_template_expands_branch_id_and_username(
     work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
 ) -> None:
-    rc, out, _err = run_export("--branch-name-template", TEMPLATE)
+    rc, out, _err = run_export("-v", "--branch-name-template", TEMPLATE)
 
     assert rc == 0
-    assert "wip/feature/3-testbot  Add c" in out
+    assert "wip/feature/3-testbot  Add c" in out  # the stack table
+    assert result_block(out)[-1] == (
+        "Branches pushed: wip/feature/1-testbot (new), wip/feature/2-testbot (new), "
+        "wip/feature/3-testbot (new)"
+    )
     branches = work.remote.branches()
     assert sorted(branches) == [
         "main",
@@ -842,7 +975,8 @@ def test_branch_name_template_reexport_reuses_branches(
     rc, out, _err = run_export("--branch-name-template", TEMPLATE)
 
     assert rc == 0
-    assert "Everything is up to date; nothing to do." in out
+    assert result_block(out)[0] == "Up to date: 3 pull requests, nothing to push."
+    assert "Branches pushed:" not in out
     assert work.remote.branches() == branches
     assert work.head() == head
     assert len(fake_gh.calls("pr", "create")) == 3
@@ -910,7 +1044,8 @@ def test_reexport_of_multi_paragraph_message_does_not_duplicate_trailer(
     rc, out, _err = run_export()
 
     assert rc == 0
-    assert "Everything is up to date" in out
+    assert result_block(out)[0] == "Up to date: 2 pull requests, nothing to push."
+    assert "Branches pushed:" not in out
     assert work.head() == head
     assert (
         raw_message(work, work.shas()[0])
@@ -921,19 +1056,27 @@ def test_reexport_of_multi_paragraph_message_does_not_duplicate_trailer(
 # --------------------------------------------------------------------------- #
 # 15. --verbose
 # --------------------------------------------------------------------------- #
-def test_verbose_logs_git_and_gh_commands_to_stderr(
-    work: Work, fake_gh: FakeGitHub, stack3: list[str]
-) -> None:
-    # Run in a fresh interpreter: under pytest the root logger already has
-    # handlers, so the CLI's ``logging.basicConfig`` would be a no-op.
-    proc = subprocess.run(
-        [sys.executable, "-m", "pstack_pr", "export", "-v", "-n"],
+def export_in_subprocess(work: Work, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run the CLI in a fresh interpreter.
+
+    Under pytest the root logger already has handlers, so the CLI's
+    ``logging.basicConfig`` (which the command log relies on) would be a no-op
+    in-process.
+    """
+    return subprocess.run(
+        [sys.executable, "-m", "pstack_pr", "export", *args],
         cwd=work.path,
         env=dict(os.environ),
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def test_double_verbose_logs_git_and_gh_commands_to_stderr(
+    work: Work, fake_gh: FakeGitHub, stack3: list[str]
+) -> None:
+    proc = export_in_subprocess(work, "-vv", "-n")
 
     assert proc.returncode == 0, proc.stderr
     assert "Dry run: nothing was changed." in proc.stdout
@@ -944,6 +1087,17 @@ def test_verbose_logs_git_and_gh_commands_to_stderr(
     assert "$ git " not in proc.stdout
     assert work.head() == stack3[-1]
     assert fake_gh.write_calls() == []
+
+
+def test_single_verbose_does_not_log_commands_to_stderr(
+    work: Work, fake_gh: FakeGitHub, stack3: list[str]
+) -> None:
+    proc = export_in_subprocess(work, "-v", "-n")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "Dry run: nothing was changed." in proc.stdout
+    assert "Fetching origin..." in proc.stdout
+    assert proc.stderr == ""
 
 
 def test_without_verbose_nothing_is_logged_to_stderr(

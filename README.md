@@ -13,15 +13,17 @@ Nothing to install; [uv](https://docs.astral.sh/uv/) fetches the tool and a
 Python for it:
 
 ```sh
-uvx --from git+https://github.com/georgekarpenkov/stack-pr pstack-pr export -n   # preview
-uvx --from git+https://github.com/georgekarpenkov/stack-pr pstack-pr export      # do it
+uvx --from git+https://github.com/georgekarpenkov/stack-pr@v0.2.1 pstack-pr export -n   # preview
+uvx --from git+https://github.com/georgekarpenkov/stack-pr@v0.2.1 pstack-pr export      # do it
 ```
 
 For a persistent `pstack-pr` command:
 
 ```sh
-uv tool install git+https://github.com/georgekarpenkov/stack-pr
+uv tool install git+https://github.com/georgekarpenkov/stack-pr@v0.2.1
 ```
+
+`v0.2.1` is the latest release tag; see [CHANGELOG.md](CHANGELOG.md).
 
 Requirements: `git`, and the GitHub CLI [`gh`](https://cli.github.com/) logged
 in (`gh auth login`). Python is handled by uv.
@@ -65,8 +67,9 @@ Planning is read-only apart from `git fetch`: the stack is the linear range
 from the merge base of `HEAD` and `origin/main` to `HEAD`, each commit is
 mapped to a branch (from its `stack-info:` trailer, or a remote branch whose
 tip is that exact commit, or a fresh `<user>/stack/N`) and its existing PR is
-looked up. The plan is then printed and, unless `--dry-run` was given, run in
-this order:
+looked up. `--dry-run` prints the resulting plan and stops; `-v` prints it and
+then shows each step as it runs; by default only the result is printed. The
+steps run in this order:
 
 1. Retarget PRs that GitHub would otherwise auto-close (only when commits were
    reordered): their base is pointed at `main` and they are marked draft
@@ -108,18 +111,30 @@ Plan:
 Dry run: nothing was changed.
 ```
 
-Without `--dry-run` the same plan is executed step by step and finishes with
-the list of PRs:
+Without `--dry-run` the plan is executed and only the result is printed: one
+line per PR marked `new`, `updated` or `unchanged`, and the branches pushed.
 
 ```
-Exported 3 pull requests:
-   3  #3      https://github.com/octo/widgets/pull/3  Add c
-   2  #2      https://github.com/octo/widgets/pull/2  Add b
-   1  #1      https://github.com/octo/widgets/pull/1  Add a
+Exported 3 pull requests (3 new):
+   3  #3  new        https://github.com/octo/widgets/pull/3  Add c
+   2  #2  new        https://github.com/octo/widgets/pull/2  Add b
+   1  #1  new        https://github.com/octo/widgets/pull/1  Add a
+Branches pushed: alice/stack/1 (new), alice/stack/2 (new), alice/stack/3 (new)
 ```
 
-Running it again right away prints the stack with its PR numbers followed by
-`Everything is up to date; nothing to do.`
+After amending the top commit and exporting again:
+
+```
+Exported 3 pull requests (1 updated, 2 unchanged):
+   3  #3  updated    https://github.com/octo/widgets/pull/3  Add c
+   2  #2  unchanged  https://github.com/octo/widgets/pull/2  Add b
+   1  #1  unchanged  https://github.com/octo/widgets/pull/1  Add a
+Branches pushed: alice/stack/3 (updated)
+```
+
+Running it again right away prints `Up to date: 3 pull requests, nothing to
+push.` followed by the same list. Pass `-v` to also see the plan and each step
+as it runs, `-vv` for every `git` and `gh` command.
 
 ## Safety
 
@@ -166,7 +181,7 @@ Running it again right away prints the stack with its PR numbers followed by
 | `--reviewer REVIEWER` | | comma-separated GitHub handles to request reviews from on new PRs |
 | `--keep-body` | off | keep existing PR descriptions and only refresh the cross-links |
 | `--branch-name-template T` | `$USERNAME/stack` | template for stack branch names |
-| `-v`, `--verbose` | off | show every git and gh command that is run |
+| `-v`, `--verbose` | off | show the plan and progress while it runs; `-vv` also shows every git and gh command |
 
 Defaults can be set in `.pstack-pr.cfg` at the repository root (or the file
 named by the `PSTACK_PR_CONFIG` environment variable). Command line flags win.

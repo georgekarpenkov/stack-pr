@@ -1,6 +1,6 @@
 [project]
 name = "pstack-pr"
-version = "0.2.0"
+version = "0.2.1"
 description = "Export a linear stack of git commits as a chain of stacked GitHub pull requests"
 readme = "README.md"
 license = { file = "LICENSE" }

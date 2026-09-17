@@ -79,7 +79,7 @@ def test_reorder_keeps_all_prs_open_via_transient_retarget(
     start = n_calls(fake_gh)
     head_before = work.head()
 
-    rc, out, err = run_export()
+    rc, out, err = run_export("-v")
     assert rc == 0, err
     assert "retarget PR #3 to 'main' during the push, marking it draft meanwhile" in out
     assert "'testbot/stack/2' now sits above it in the stack" in out
@@ -137,6 +137,15 @@ def test_reorder_keeps_all_prs_open_via_transient_retarget(
     assert remote.sha(BRANCH.format(1)) == work.head("HEAD~2")
     assert work.head() == head_before
     assert "rewrite" not in out
+    # Every PR changed (bases and cross-links) and the two branches that had to
+    # move are reported bottom of the stack first; #1 stayed where it was.
+    assert "Exported 3 pull requests (3 updated):" in out
+    assert f"   3  #2  updated    {PR_URL.format(2)}  Add b" in out
+    assert f"   2  #3  updated    {PR_URL.format(3)}  Add c" in out
+    assert f"   1  #1  updated    {PR_URL.format(1)}  Add a" in out
+    assert (
+        "Branches pushed: testbot/stack/3 (updated), testbot/stack/2 (updated)\n" in out
+    )
     assert fake_gh.pr(3)["body"].startswith("Stacked PRs:\n * #2\n * __->__#3\n * #1\n")
     assert fake_gh.pr(2)["body"].startswith("Stacked PRs:\n * __->__#2\n * #3\n * #1\n")
     # The temporary-draft marker written during the retarget is gone again.
@@ -152,7 +161,7 @@ def test_reorder_of_draft_pr_does_not_toggle_ready_state(
 
     swap_top_two(work)
     start = n_calls(fake_gh)
-    rc, out, err = run_export()
+    rc, out, err = run_export("-v")
     assert rc == 0, err
     assert "retarget PR #3 to 'main' during the push (GitHub would auto-close" in out
     assert "marking it draft" not in out
@@ -206,8 +215,15 @@ def test_failure_during_pr_creation_leaves_local_repo_untouched(
     messages_before = work.messages()
     reflog_before = work.reflog("feature")
 
-    rc, _, err = run_export()
+    rc, out, err = run_export()
     assert rc == 1
+    # A quiet run names the step that failed before the error, and there is no
+    # result block to print.
+    assert (
+        "warning: failed while trying to: create PR for "
+        f"{stack3[1][:8]}: {BRANCH.format(2)} -> {BRANCH.format(1)}"
+    ) in err
+    assert out.strip() == ""
     assert "warning: local branches were not modified" in err
     assert (
         "re-run 'pstack-pr export' to resume (branches pushed so far are reused)" in err
@@ -245,7 +261,7 @@ def test_rerun_after_interrupted_pr_creation_adopts_pushed_branches(
     monkeypatch.delenv("FAKE_GH_FAIL_ON")
     start = n_calls(fake_gh)
 
-    rc, out, err = run_export()
+    rc, out, err = run_export("-v")
     assert rc == 0, err
     assert out.count("(recovered)") == 3
     # Original commits are already on the remote, so nothing is pushed before
@@ -267,6 +283,16 @@ def test_rerun_after_interrupted_pr_creation_adopts_pushed_branches(
     assert fake_gh.pr(1)["title"] == "Add a"
     assert fake_gh.pr(2)["title"] == "Add b"
     assert fake_gh.pr(3)["title"] == "Add c"
+    # PR #1 survived the interrupted run, so only two PRs are new. All three
+    # branches were pushed by that run already, so none of them is new.
+    assert "Exported 3 pull requests (2 new, 1 updated):" in out
+    assert f"   3  #3  new        {PR_URL.format(3)}  Add c" in out
+    assert f"   2  #2  new        {PR_URL.format(2)}  Add b" in out
+    assert f"   1  #1  updated    {PR_URL.format(1)}  Add a" in out
+    assert (
+        "Branches pushed: testbot/stack/1 (updated), testbot/stack/2 (updated), "
+        "testbot/stack/3 (updated)\n"
+    ) in out
 
     new_shas = work.shas()
     assert new_shas != stack3
@@ -279,11 +305,14 @@ def test_rerun_after_interrupted_pr_creation_adopts_pushed_branches(
     # The recovery run also pushed the rewritten commits, so a third run has
     # nothing left to do.
     assert [remote.sha(BRANCH.format(i)) for i in (1, 2, 3)] == new_shas
-    rc, out, err = run_export()
+    rc, out, err = run_export("-v")
     assert rc == 0, err
     assert "Everything is up to date; nothing to do." in out
     assert "create PR" not in out
     assert "rewrite" not in out
+    assert "Up to date: 3 pull requests, nothing to push." in out
+    assert out.count("  unchanged  ") == 3
+    assert "Branches pushed:" not in out
     assert [remote.sha(BRANCH.format(i)) for i in (1, 2, 3)] == new_shas
 
 
@@ -301,10 +330,14 @@ def test_recovery_run_pushes_rewritten_commits_to_remote(
     assert rc == 1
     monkeypatch.delenv("FAKE_GH_FAIL_ON")
 
-    rc, out, err = run_export()
+    rc, out, err = run_export("-v")
     assert rc == 0, err
     assert work.shas() != stack3
     assert "push the stack to origin" in out
+    assert (
+        "Branches pushed: testbot/stack/1 (updated), testbot/stack/2 (updated), "
+        "testbot/stack/3 (updated)\n"
+    ) in out
     assert [remote.sha(BRANCH.format(i)) for i in (1, 2, 3)] == work.shas()
 
 
@@ -332,7 +365,7 @@ def test_rerun_after_local_update_only_finishes_remote_side(
     reflog_before = work.reflog("feature")
     start = n_calls(fake_gh)
 
-    rc, out, err = run_export()
+    rc, out, err = run_export("-v")
     assert rc == 0, err
     assert "rewrite" not in out
     assert "move feature" not in out
@@ -340,6 +373,9 @@ def test_rerun_after_local_update_only_finishes_remote_side(
     assert (
         "push the stack to origin (--atomic --force-with-lease): testbot/stack/2" in out
     )
+    # Only branch 2 lagged behind; every PR got its cross-links back.
+    assert "Exported 3 pull requests (3 updated):" in out
+    assert "Branches pushed: testbot/stack/2 (updated)\n" in out
     assert work.head() == c1
     assert work.shas() == [a1, b1, c1]
     assert work.reflog("feature") == reflog_before
@@ -571,7 +607,8 @@ def test_head_sha_without_branch_is_rejected_before_any_write(
     messages_before = work.messages("origin/main..feature")
     branches_before = remote.branches()
 
-    rc, out, err = run_export("-H", stack3[-1])
+    # -v so that any plan or step text reaching stdout would be caught below.
+    rc, out, err = run_export("-v", "-H", stack3[-1])
     assert rc == 1
     assert (
         f"error: no local branch points at '{stack3[-1]}' and HEAD does not "
@@ -601,7 +638,7 @@ def test_head_branch_option_moves_that_branch_not_the_checked_out_one(
     work.git("checkout", "-q", "main")
     main_sha = work.head()
 
-    rc, out, err = run_export("-H", "feature")
+    rc, out, err = run_export("-v", "-H", "feature")
     assert rc == 0, err
     assert "warning:" not in err
     assert f"move feature from {stack3[-1][:8]} to the rewritten tip" in out
@@ -620,7 +657,7 @@ def test_detached_head_is_moved_and_branch_left_alone(
     work: Work, remote: Remote, run_export: RunExport, stack3: list[str]
 ) -> None:
     work.git("checkout", "-q", "--detach")
-    rc, out, err = run_export()
+    rc, out, err = run_export("-v")
     assert rc == 0, err
     assert f"move HEAD (detached) from {stack3[-1][:8]} to the rewritten tip" in out
     assert work.git("symbolic-ref", "-q", "HEAD", check=False) == ""
@@ -752,6 +789,10 @@ def test_push_lease_rejects_update_that_raced_the_fetch(
     rc, _, err = run_export()
     assert marker.exists()
     assert rc == 1
+    assert (
+        "warning: failed while trying to: push the stack to origin "
+        f"(--atomic --force-with-lease): {BRANCH.format(2)}, {BRANCH.format(3)}"
+    ) in err
     assert "stale info" in err
     assert "warning: local branches were not modified" in err
     # Atomic push: neither branch moved, and the concurrent commit is intact.
@@ -763,8 +804,16 @@ def test_push_lease_rejects_update_that_raced_the_fetch(
 
     # After fetching the concurrent update, the re-run takes the lease on it.
     start = n_calls(fake_gh)
-    rc, _, err = run_export()
+    rc, out, err = run_export()
     assert rc == 0, err
+    # Only the amended commit and the one above it moved; #1 is untouched.
+    assert "Exported 3 pull requests (2 updated, 1 unchanged):" in out
+    assert f"   3  #3  updated    {PR_URL.format(3)}  Add c" in out
+    assert f"   2  #2  updated    {PR_URL.format(2)}  Add b" in out
+    assert f"   1  #1  unchanged  {PR_URL.format(1)}  Add a" in out
+    assert (
+        "Branches pushed: testbot/stack/2 (updated), testbot/stack/3 (updated)\n" in out
+    )
     assert remote.sha(BRANCH.format(2)) == b2
     assert remote.sha(BRANCH.format(3)) == c2
     assert work.shas() == [a1, b2, c2]
@@ -792,11 +841,14 @@ def test_existing_branches_outside_template_glob_are_kept(
     branches_before = remote.branches()
     start = n_calls(fake_gh)
 
-    rc, out, err = run_export("--branch-name-template", "other/$ID")
+    rc, out, err = run_export("-v", "--branch-name-template", "other/$ID")
     assert rc == 0, err
     assert "Everything is up to date; nothing to do." in out
     assert "new branch" not in out
-    assert "push" not in out
+    assert "push to origin" not in out
+    assert "push the stack" not in out
+    assert "Up to date: 3 pull requests, nothing to push." in out
+    assert "Branches pushed:" not in out
     assert "other/" not in out
     for n in (1, 2, 3):
         assert (
@@ -824,8 +876,12 @@ def test_new_commit_with_other_template_gets_a_branch_from_that_template(
     assert rc == 0
     work.commit("d.txt", "Add d")
 
-    rc, _, err = run_export("--branch-name-template", "other/$ID")
+    rc, out, err = run_export("--branch-name-template", "other/$ID")
     assert rc == 0, err
+    # One new PR on a brand-new branch; the others only get fresh cross-links.
+    assert "Exported 4 pull requests (1 new, 3 updated):" in out
+    assert f"   4  #4  new        {PR_URL.format(4)}  Add d" in out
+    assert "Branches pushed: other/1 (new)\n" in out
     assert fake_gh.pr(4)["headRefName"] == "other/1"
     assert fake_gh.pr(4)["baseRefName"] == BRANCH.format(3)
     assert remote.sha("other/1") == work.head()
@@ -849,7 +905,7 @@ def test_non_ascii_message_round_trips(
 
     rc, out, err = run_export()
     assert rc == 0, err
-    assert title in out
+    assert f"   2  #2  new        {PR_URL.format(2)}  {title}" in out
     assert fake_gh.pr(2)["title"] == title
     assert fake_gh.pr(2)["body"] == (
         f"Stacked PRs:\n * __->__#2\n * #1\n\n--- --- ---\n\n### {title}\n\n{body}"

@@ -140,7 +140,8 @@ def test_export_creates_two_stacked_prs(gh_repo: GhRepo, two_commits: Progress) 
     res = gh_repo.export()
 
     assert res.rc == 0, res.err
-    assert "Exported 2 pull requests:" in res.out
+    assert "Exported 2 pull requests (2 new):" in res.out
+    assert f"Branches pushed: {b1} (new), {b2} (new)" in res.out
 
     # Local side: messages gained exactly one stack-info trailer each.
     infos = stack_infos(gh_repo)
@@ -161,7 +162,7 @@ def test_export_creates_two_stacked_prs(gh_repo: GhRepo, two_commits: Progress) 
     assert gh_repo.status() == status_before
     assert gh_repo.reflog(gh_repo.branch)[0] == "pstack-pr export"
     for number, url, title in ((n1, url1, title_a), (n2, url2, title_b)):
-        summary = rf"#{number}\s+{re.escape(url)}  {re.escape(title)}$"
+        summary = rf"#{number}\s+new\s+{re.escape(url)}  {re.escape(title)}$"
         assert re.search(summary, res.out, re.MULTILINE), res.out
 
     # Remote side: both branches point at the rewritten commits.
@@ -201,9 +202,10 @@ def test_reexport_without_changes_is_a_noop(
     res = gh_repo.export()
 
     assert res.rc == 0, res.err
-    assert "Everything is up to date; nothing to do." in res.out
-    assert f"#{n1}" in res.out
-    assert f"#{n2}" in res.out
+    assert "Up to date: 2 pull requests, nothing to push." in res.out
+    assert re.search(rf"#{n1}\s+unchanged", res.out)
+    assert re.search(rf"#{n2}\s+unchanged", res.out)
+    assert "Branches pushed:" not in res.out
     assert "Plan:" not in res.out
     assert gh_repo.head() == progress.shas[1]
     assert gh_repo.shas() == progress.shas
@@ -238,12 +240,16 @@ def test_amending_top_commit_moves_only_its_branch(
     status_before = gh_repo.status()
     assert status_before == " M a.txt\n?? staged.txt"
 
-    res = gh_repo.export()
+    res = gh_repo.export("-v")  # -v: the plan and progress lines are asserted
 
     assert res.rc == 0, res.err
-    assert "Everything is up to date" not in res.out
+    assert "Up to date" not in res.out
     assert f"push the stack to origin (--atomic --force-with-lease): {b2}" in res.out
     assert "rewrite" not in res.out  # the message was already correct
+    assert "Exported 2 pull requests (1 updated, 1 unchanged):" in res.out
+    assert re.search(rf"#{n2}\s+updated", res.out)
+    assert re.search(rf"#{n1}\s+unchanged", res.out)
+    assert f"Branches pushed: {b2} (updated)" in res.out
     assert gh_repo.head() == amended
     assert gh_repo.shas() == [progress.shas[0], amended]
     assert gh_repo.status() == status_before
@@ -287,7 +293,7 @@ def test_swapping_commits_retargets_prs_without_closing_them(
     assert new_b not in progress.shas
     assert new_a not in progress.shas
 
-    res = gh_repo.export()
+    res = gh_repo.export("-v")  # -v: the plan lines are asserted below
 
     assert res.rc == 0, res.err
     assert (

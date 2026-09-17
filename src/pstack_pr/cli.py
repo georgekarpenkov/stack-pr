@@ -104,9 +104,9 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
     export.add_argument(
         "-v",
         "--verbose",
-        action="store_true",
-        default=config.verbose,
-        help="show every git and gh command that is run",
+        action="count",
+        default=1 if config.verbose else 0,
+        help="show the plan and progress while it runs; -vv also shows every git and gh command",
     )
     return parser
 
@@ -124,26 +124,29 @@ def run_export(git: Git, args: argparse.Namespace, ui: UI) -> int:
         keep_body=args.keep_body,
         branch_template=args.branch_name_template,
     )
-    plan = plan_export(git, opts, ui)
+    verbose = args.dry_run or args.verbose >= 1
+    plan = plan_export(git, opts, ui, show_progress=verbose)
     if not plan.stack.entries:
         base = args.base or f"{opts.remote}/{opts.target}"
         ui.info(f"Nothing to export: no commits in {base}..{opts.head}.")
         return 0
 
-    plan.print_stack(ui)
-    plan.print_steps(ui)
+    if verbose:
+        plan.print_stack(ui)
+        plan.print_steps(ui)
     if args.dry_run:
         ui.info()
         ui.info(ui.bold("Dry run") + ": nothing was changed.")
         return 0
-    if not plan.active_steps():
-        return 0
 
-    ui.info()
-    try:
-        plan.execute(ui)
-    except (KeyboardInterrupt, PstackError):
+    show_progress = verbose and bool(plan.active_steps())
+    if show_progress:
         ui.info()
+    try:
+        plan.execute(ui, show_progress=show_progress)
+    except (KeyboardInterrupt, PstackError):
+        if show_progress:
+            ui.info()
         if plan.local_refs_updated:
             ui.warn(
                 "local branches were already updated; re-run 'pstack-pr export' "
@@ -155,6 +158,8 @@ def run_export(git: Git, args: argparse.Namespace, ui: UI) -> int:
                 "resume (branches pushed so far are reused)"
             )
         raise
+    if show_progress:
+        ui.info()
     plan.print_result(ui)
     return 0
 
@@ -177,7 +182,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = build_parser(config).parse_args(argv)
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
+        level=logging.DEBUG if args.verbose >= 2 else logging.WARNING,  # noqa: PLR2004
         format="%(message)s",
         stream=sys.stderr,
     )

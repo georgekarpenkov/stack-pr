@@ -40,7 +40,8 @@ def test_export_defaults_from_default_config() -> None:
     assert args.draft is False
     assert args.reviewer == ""
     assert args.dry_run is False
-    assert args.verbose is False
+    assert args.verbose == 0
+    assert not isinstance(args.verbose, bool)  # -v counts; it is not a switch
     assert args.keep_body is False
     assert args.branch_name_template == "$USERNAME/stack"
 
@@ -57,7 +58,7 @@ def test_export_defaults_exact_namespace() -> None:
         "reviewer": "",
         "keep_body": False,
         "branch_name_template": "$USERNAME/stack",
-        "verbose": False,
+        "verbose": 0,
     }
 
 
@@ -78,7 +79,7 @@ def test_config_values_become_parser_defaults() -> None:
     assert args.branch_name_template == "$USERNAME/$BRANCH/pr"
     assert args.draft is True
     assert args.keep_body is True
-    assert args.verbose is True
+    assert args.verbose == 1
     # Not configurable: always the same regardless of the config.
     assert args.base is None
     assert args.head == "HEAD"
@@ -133,7 +134,7 @@ def test_short_flags_parse() -> None:
     assert args.base == "abc123"
     assert args.head == "feature"
     assert args.draft is True
-    assert args.verbose is True
+    assert args.verbose == 1
 
 
 def test_long_flags_parse() -> None:
@@ -161,8 +162,22 @@ def test_long_flags_parse() -> None:
         "reviewer": "x,y",
         "keep_body": True,
         "branch_name_template": "t/$ID",
-        "verbose": True,
+        "verbose": 1,
     }
+
+
+def test_verbose_flag_counts_occurrences() -> None:
+    assert parse("export", "-v").verbose == 1
+    assert parse("export", "-vv").verbose == 2
+    assert parse("export", "-v", "-v").verbose == 2
+    assert parse("export", "--verbose", "--verbose").verbose == 2
+    assert parse("export", "-vvv").verbose == 3
+
+
+def test_verbose_from_config_is_one_and_flags_add_to_it() -> None:
+    assert parse("export", config=Config(verbose=True)).verbose == 1
+    assert parse("export", "-v", config=Config(verbose=True)).verbose == 2
+    assert parse("export", "-vv", config=Config(verbose=True)).verbose == 3
 
 
 def test_reviewer_flag_keeps_raw_string() -> None:
@@ -395,11 +410,24 @@ def test_export_nothing_to_export_when_no_commits_above_main(
     rc = main(["export"])
     out, err = capsys.readouterr()
     assert rc == 0
-    assert "Nothing to export: no commits in origin/main..HEAD." in out
-    assert "Fetching origin..." in out
+    # A default run is silent while it works: the one line is the whole output.
+    assert out == "Nothing to export: no commits in origin/main..HEAD.\n"
     assert err == ""
     assert fake_gh.calls() == []
     assert work.remote.branches() == {"main": work.head("origin/main")}
+
+
+def test_export_nothing_to_export_verbose_shows_fetch_first(
+    work: Work, fake_gh: FakeGitHub, run_export: RunExport
+) -> None:
+    rc, out, err = run_export("-v")
+    assert rc == 0
+    assert (
+        out
+        == "Fetching origin...\nNothing to export: no commits in origin/main..HEAD.\n"
+    )
+    assert err == ""
+    assert fake_gh.calls() == []
 
 
 def test_export_nothing_to_export_via_run_export_fixture(
@@ -494,15 +522,138 @@ def test_export_reviewers_from_config_reach_gh(
     assert fake_gh.pr(3)["reviewers"] == ["cfg-a", "cfg-b"]
 
 
+PULL = "https://github.com/octo/widgets/pull"
+
+STACK3_EXPORTED = (
+    "Exported 3 pull requests (3 new):\n"
+    f"   3  #3  new        {PULL}/3  Add c\n"
+    f"   2  #2  new        {PULL}/2  Add b\n"
+    f"   1  #1  new        {PULL}/1  Add a\n"
+    "Branches pushed: testbot/stack/1 (new), testbot/stack/2 (new), testbot/stack/3 (new)\n"
+)
+
+STACK3_UP_TO_DATE = (
+    "Up to date: 3 pull requests, nothing to push.\n"
+    f"   3  #3  unchanged  {PULL}/3  Add c\n"
+    f"   2  #2  unchanged  {PULL}/2  Add b\n"
+    f"   1  #1  unchanged  {PULL}/1  Add a\n"
+)
+
+
 def test_export_prints_result_with_pr_urls(
     fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
 ) -> None:
     rc, out, err = run_export()
     assert rc == 0
     assert err == ""
-    assert "Exported 3 pull requests:" in out
-    for n, title in ((1, "Add a"), (2, "Add b"), (3, "Add c")):
-        assert f"https://github.com/octo/widgets/pull/{n}  {title}" in out
+    # Without -v the result block is the *entire* output: no fetch notice, no
+    # stack table, no plan, no progress lines.
+    assert out == STACK3_EXPORTED
+
+
+def test_export_rerun_reports_up_to_date_and_nothing_pushed(
+    fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    assert run_export()[0] == 0
+    remote_before = fake_gh.state()
+    rc, out, err = run_export()
+    assert rc == 0
+    assert err == ""
+    assert out == STACK3_UP_TO_DATE
+    assert "Branches pushed:" not in out
+    assert fake_gh.state()["prs"] == remote_before["prs"]
+
+
+def test_export_verbose_prints_fetch_stack_plan_progress_then_result(
+    work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    rc, out, err = run_export("-v")
+    assert rc == 0
+    assert err == ""
+    base = work.head("origin/main")[:8]
+    landmarks = [
+        "Fetching origin...\n",
+        f"Stack of 3 commits on feature (base: origin/main @ {base})\n",
+        "   3  ",  # the stack table lists the newest commit first
+        "  new PR  testbot/stack/3  Add c\n",
+        "\nPlan:\n",
+        "   1. push to origin: ",
+        "  10. update the new PR for ",
+        "\n\n  [1/10] push to origin: ",
+        "  [10/10] update PR #3: body (cross-links)\n",
+        "\n\n" + STACK3_EXPORTED,
+    ]
+    assert out.startswith(landmarks[0])
+    assert out.endswith(landmarks[-1])
+    positions = [out.find(mark) for mark in landmarks]
+    assert -1 not in positions, dict(zip(landmarks, positions, strict=True))
+    assert positions == sorted(positions), out
+    # A single -v does not echo the git and gh commands; that needs -vv.
+    assert "$ git" not in out
+
+
+def test_export_verbose_rerun_says_nothing_to_do_and_up_to_date(
+    fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    assert run_export()[0] == 0
+    rc, out, err = run_export("-v")
+    assert rc == 0
+    assert err == ""
+    assert out.startswith("Fetching origin...\nStack of 3 commits on feature ")
+    assert "\nEverything is up to date; nothing to do.\n" in out
+    assert "Plan:" not in out
+    assert "[1/" not in out
+    assert out.endswith("\n" + STACK3_UP_TO_DATE)
+
+
+def test_export_config_verbose_true_behaves_like_dash_v(
+    work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    (work.path / ".pstack-pr.cfg").write_text("[common]\nverbose = true\n")
+    rc, out, err = run_export()
+    assert rc == 0
+    assert err == ""
+    assert out.startswith("Fetching origin...\nStack of 3 commits on feature ")
+    assert "\nPlan:\n" in out
+    assert "  [1/10] push to origin: " in out
+    assert out.endswith("\n\n" + STACK3_EXPORTED)
+
+
+def test_export_failed_step_is_named_on_stderr_in_a_quiet_run(
+    work: Work,
+    fake_gh: FakeGitHub,
+    run_export: RunExport,
+    stack3: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FAKE_GH_FAIL_ON", "pr create:1")
+    rc, out, err = run_export()
+    assert rc == 1
+    # Nothing was printed to stdout while working, so stderr must say which
+    # step failed before the error itself and the recovery hint.
+    short = stack3[0][:8]
+    warning = f"warning: failed while trying to: create PR for {short}: testbot/stack/1 -> main\n"
+    assert err.startswith(warning)
+    assert "warning: local branches were not modified" in err
+    assert "error: " in err
+    assert (
+        err.index(warning) < err.index("warning: local branches") < err.index("error: ")
+    )
+    assert "injected failure for 'pr create'" in err
+    assert "Exported" not in out
+    assert "Up to date" not in out
+
+    # With -v the progress line already names the step, so no extra warning.
+    # (The branches pushed by the first run are adopted, so no push step now;
+    # fake gh counts 'pr create' calls across runs, hence ':2'.)
+    monkeypatch.setenv("FAKE_GH_FAIL_ON", "pr create:2")
+    rc, out, err = run_export("-v")
+    assert rc == 1
+    assert "failed while trying to" not in err
+    assert f"  [1/9] create PR for {short}: testbot/stack/1 -> main\n" in out
+    assert "  [2/9]" not in out
+    assert "error: " in err
+    assert "injected failure for 'pr create'" in err
 
 
 def test_export_error_from_plan_is_printed_and_returns_one(
