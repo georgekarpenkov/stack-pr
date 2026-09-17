@@ -291,3 +291,4 @@ into `~/.claude/skills/` to have it in every project.
 
 Apache License 2.0 with LLVM Exceptions; see [LICENSE](LICENSE).
 Apache License 2.0 with LLVM Exceptions; see [LICENSE](LICENSE).
+Apache License 2.0 with LLVM Exceptions; see [LICENSE](LICENSE).
