@@ -34,6 +34,7 @@ pstack-pr = "pstack_pr.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "pytest-xdist>=3",
     "mypy>=1.10",
     "ruff>=0.5",
 ]
@@ -93,7 +94,9 @@ multiline-quotes = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-ra"
+# Run test files in parallel; --dist loadfile keeps each file's tests on one
+# worker, which the order-dependent integration tests rely on.
+addopts = "-ra -n auto --dist loadfile"
 markers = [
     "integration: talks to a real GitHub repository (opt in with --integration)",
 ]
