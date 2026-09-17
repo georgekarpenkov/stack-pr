@@ -1,249 +1,354 @@
+"""Git plumbing.
+
+Everything here is built on plumbing commands (``rev-list``, ``cat-file``,
+``commit-tree``, ``update-ref``, ``for-each-ref``, ``push``) so that the tool
+never touches the working tree or the index. Commits are rewritten by creating
+new commit objects and moving refs with compare-and-swap semantics, which means
+an interrupted run leaves the repository exactly as it was.
+"""
+
 from __future__ import annotations
 
 import re
-import string
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from pstack_pr.shell_commands import get_command_output, run_shell_command
+from pstack_pr import shell
+from pstack_pr.errors import PstackError
+
+ZERO_SHA = "0" * 40
+SHORT_SHA_LEN = 8
+
+_IDENTITY_RE = re.compile(r"^(?P<name>.*?) <(?P<email>[^>]*)> (?P<date>\d+ [+-]\d{4})$")
 
 
-class GitError(Exception):
-    pass
+@dataclass(frozen=True)
+class Identity:
+    """An author or committer line: name, email and a date in git's raw format."""
+
+    name: str
+    email: str
+    date: str  # e.g. "1700000000 +0100"
+
+    @classmethod
+    def parse(cls, value: str) -> Identity:
+        m = _IDENTITY_RE.match(value)
+        if not m:
+            raise PstackError(f"cannot parse git identity line: {value!r}")
+        return cls(m.group("name"), m.group("email"), m.group("date"))
+
+    def env(self, role: str) -> dict[str, str]:
+        """Environment variables that make ``commit-tree`` reuse this identity."""
+        return {
+            f"GIT_{role}_NAME": self.name,
+            f"GIT_{role}_EMAIL": self.email,
+            f"GIT_{role}_DATE": self.date,
+        }
 
 
-# Git constants
-GIT_NOT_A_REPO_ERROR = 128
-GIT_SHA_LENGTH = 40
+@dataclass(frozen=True)
+class Commit:
+    """A parsed commit object."""
 
+    sha: str
+    tree: str
+    parents: tuple[str, ...]
+    author: Identity
+    committer: Identity
+    message: str
+    encoding: str | None = None  # the ``encoding`` header, if the commit has one
 
-@dataclass
-class GitConfig:
-    """
-    Configuration for git operations.
-    """
+    @property
+    def short(self) -> str:
+        return self.sha[:SHORT_SHA_LEN]
 
-    username_override: str | None = None
+    @property
+    def title(self) -> str:
+        return self.message.strip().split("\n", 1)[0].strip()
 
-    def set_username_override(self, username: str | None) -> None:
-        """Override username for testing purposes. Call with None to reset."""
-        self.username_override = username
+    @property
+    def is_merge(self) -> bool:
+        return len(self.parents) > 1
 
-
-# Create a singleton instance
-git_config = GitConfig()
-
-
-def is_full_git_sha(s: str) -> bool:
-    """Return True if the given string is a valid full git SHA.
-
-    The string needs to consist of 40 lowercase hex characters.
-
-    """
-    if len(s) != GIT_SHA_LENGTH:
-        return False
-
-    digits = set(string.hexdigits.lower())
-    return all(c in digits for c in s)
-
-
-def branch_exists(branch: str, repo_dir: Path | None = None) -> bool:
-    """Returns whether a branch with the given name exists.
-
-    Args:
-        branch: branch name as a string.
-        repo_dir: path to the repo. Defaults to the current working directory.
-
-    Returns:
-        True if the branch exists, False otherwise.
-
-    Raises:
-        GitError: if called outside a git repo.
-    """
-    proc = run_shell_command(
-        ["git", "show-ref", "-q", f"refs/heads/{branch}"],
-        stderr=subprocess.DEVNULL,
-        cwd=repo_dir,
-        check=False,
-        quiet=True,
-    )
-    if proc.returncode == 0:
-        return True
-    if proc.returncode == 1:
-        return False
-    raise GitError("Not inside a valid git repository.")
-
-
-def get_current_branch_name(repo_dir: Path | None = None) -> str:
-    """Returns the name of the branch currently checked out.
-
-    Args:
-        repo_dir: path to the repo. Defaults to the current working directory.
-
-    Returns:
-        The name of the branch currently checked out, or "HEAD" if the repo is
-        in a 'detached HEAD' state
-
-    Raises:
-        GitError: if called outside a git repo, or the repo doesn't have any
-        commits yet.
-    """
-
-    try:
-        return get_command_output(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir
-        ).strip()
-    except subprocess.CalledProcessError as e:
-        if e.returncode == GIT_NOT_A_REPO_ERROR:
-            raise GitError("Not inside a valid git repository.") from e
-        raise
-
-
-def get_repo_root(repo_dir: Path | None = None) -> Path:
-    """Returns the root of the git repository.
-
-    Args:
-        repo_dir: path to the repo. Defaults to the current working directory.
-
-    Returns:
-        The root of the given git repository.
-    """
-    try:
-        return Path(
-            get_command_output(
-                ["git", "rev-parse", "--show-toplevel"], cwd=repo_dir
-            ).strip()
+    @classmethod
+    def parse(cls, sha: str, raw: bytes) -> Commit:
+        """Parse the raw bytes of a commit object as printed by ``cat-file``."""
+        header_bytes, sep, message_bytes = raw.partition(b"\n\n")
+        if not sep:
+            raise PstackError(f"malformed commit object {sha}")
+        tree = None
+        parents: list[str] = []
+        author = committer = encoding = None
+        for line in shell.decode(header_bytes).split("\n"):
+            if line.startswith(" "):
+                continue  # continuation of a multi-line header such as gpgsig
+            key, _, value = line.partition(" ")
+            if key == "tree":
+                tree = value
+            elif key == "parent":
+                parents.append(value)
+            elif key == "author":
+                author = Identity.parse(value)
+            elif key == "committer":
+                committer = Identity.parse(value)
+            elif key == "encoding":
+                encoding = value
+        if tree is None or author is None or committer is None:
+            raise PstackError(f"malformed commit object {sha}")
+        return cls(
+            sha=sha,
+            tree=tree,
+            parents=tuple(parents),
+            author=author,
+            committer=committer,
+            message=shell.decode(message_bytes),
+            encoding=encoding,
         )
-    except subprocess.CalledProcessError as e:
-        if e.returncode == GIT_NOT_A_REPO_ERROR:
-            raise GitError("Not inside a valid git repository.") from e
-        raise
 
 
-def get_uncommitted_changes(
-    repo_dir: Path | None = None,
-) -> dict[str, list[str]]:
-    """Return a dictionary of uncommitted changes.
+@dataclass(frozen=True)
+class RefUpdate:
+    """Move ``ref`` from ``old`` to ``new``; fails if ``ref`` is not at ``old``."""
 
-    Args:
-        repo_dir: path to the repo. Defaults to the current working directory.
-
-    Returns:
-        A dictionary with keys as described in
-        https://git-scm.com/docs/git-status#_short_format and values as lists
-        of the corresponding changes, each change either in the format "PATH",
-        or "ORIG_PATH -> PATH".
-
-    Raises:
-        GitError: if called outside a git repo.
-    """
-    try:
-        out = get_command_output(["git", "status", "--porcelain"], cwd=repo_dir)
-    except subprocess.CalledProcessError as e:
-        if e.returncode == GIT_NOT_A_REPO_ERROR:
-            raise GitError("Not inside a valid git repository.") from None
-        raise
-
-    changes: dict[str, list[str]] = {}
-    for line in out.splitlines():
-        # First two chars are the status, changed path starts at 4th character.
-        changes.setdefault(line[:2], []).append(line[3:])
-    return changes
+    ref: str
+    new: str
+    old: str
 
 
-# TODO: enforce this as a module dependency
-def check_gh_installed() -> None:
-    """Check if the gh tool is installed.
+@dataclass(frozen=True)
+class PushRef:
+    """One refspec of a push.
 
-    Raises:
-        GitError if gh is not available.
+    ``expect`` is the value the remote ref is required to have for the push to
+    be accepted (``--force-with-lease``): a sha, ``""`` for "must not exist", or
+    ``None`` to force unconditionally.
     """
 
-    try:
-        run_shell_command(["gh"], capture_output=True, quiet=False)
-    except subprocess.CalledProcessError as err:
-        raise GitError(
-            "'gh' is not installed. Please visit https://cli.github.com/ for"
-            " installation instuctions."
-        ) from err
+    dst: str
+    src: str
+    expect: str | None = None
+
+    @property
+    def refspec(self) -> str:
+        return f"{self.src}:{self.dst}"
 
 
-def get_gh_username() -> str:
-    """Return the current github username.
+class Git:
+    """Runs git commands in one repository."""
 
-    If username_override is set, it will be used instead of the actual username.
+    def __init__(self, cwd: Path | None = None) -> None:
+        self.cwd = cwd
 
-    Returns:
-        Current github username as a string.
+    # -- low level -----------------------------------------------------------
 
-    Raises:
-        GitError: if called outside a git repo.
-    """
-    if git_config.username_override is not None:
-        return git_config.username_override
+    def run(
+        self,
+        *args: str,
+        input: bytes | str | None = None,  # noqa: A002
+        check: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return shell.run(
+            ["git", *args], input=input, check=check, cwd=self.cwd, env=env
+        )
 
-    user_query = get_command_output(
-        [
-            "gh",
-            "api",
-            "graphql",
-            "-f",
-            "owner=UserCurrent",
-            "-f",
-            "query=query{viewer{login}}",
-        ]
-    )
+    def output(
+        self,
+        *args: str,
+        input: bytes | str | None = None,  # noqa: A002
+        env: dict[str, str] | None = None,
+    ) -> str:
+        return shell.output(["git", *args], input=input, cwd=self.cwd, env=env)
 
-    # Extract the login name.
-    m = re.search(r"\"login\":\"(.*?)\"", user_query)
-    if not m:
-        raise GitError("Unable to find current github user name")
+    # -- repository state ------------------------------------------------------
 
-    return m.group(1)
+    def root(self) -> Path:
+        proc = self.run("rev-parse", "--show-toplevel", check=False)
+        if proc.returncode != 0:
+            raise PstackError("not inside a git repository")
+        return Path(shell.decode(proc.stdout).strip())
 
+    def git_dir(self) -> Path:
+        return Path(self.output("rev-parse", "--absolute-git-dir"))
 
-def get_changed_files(
-    base: str | None = None, repo_dir: Path | None = None
-) -> Sequence[Path]:
-    """Get the list of files changed between this commit and the base commit.
+    def rebase_in_progress(self) -> bool:
+        git_dir = self.git_dir()
+        return (git_dir / "rebase-merge").exists() or (
+            git_dir / "rebase-apply"
+        ).exists()
 
-    Returns:
-        A list of Path objects that correspond to the changed files.
-    """
-    get_file_changes = [
-        "git",
-        "diff",
-        "--name-only",
-        base if base is not None else "main",
-        "HEAD",
-    ]
-    result = get_command_output(get_file_changes, cwd=repo_dir)
-    return [Path(r) for r in result.split("\n")]
+    def remote_url(self, remote: str) -> str:
+        """The configured URL of ``remote`` (before any ``insteadOf`` rewriting)."""
+        proc = self.run("config", "--get", f"remote.{remote}.url", check=False)
+        if proc.returncode != 0:
+            raise PstackError(f"remote '{remote}' does not exist")
+        return shell.decode(proc.stdout).strip()
 
+    # -- revisions -------------------------------------------------------------
 
-def get_changed_dirs(
-    base: str | None = None, repo_dir: Path | None = None
-) -> set[Path]:
-    """Get the list of top-level directories changed between this commit
-       and the base commit.
+    def try_rev_parse(self, rev: str) -> str | None:
+        proc = self.run(
+            "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}", check=False
+        )
+        if proc.returncode != 0:
+            return None
+        return shell.decode(proc.stdout).strip()
 
-    Returns:
-        A list of Path objects that correspond to the directories that have
-        files changed.
-    """
-    return {Path(file.parts[0]) for file in get_changed_files(base, repo_dir)}
+    def rev_parse(self, rev: str) -> str:
+        sha = self.try_rev_parse(rev)
+        if sha is None:
+            raise PstackError(f"'{rev}' is not a valid commit")
+        return sha
 
+    def symbolic_full_name(self, rev: str) -> str | None:
+        """Full ref name behind ``rev`` (``refs/heads/x``, ``HEAD``) or None."""
+        proc = self.run("rev-parse", "--symbolic-full-name", rev, check=False)
+        if proc.returncode != 0:
+            return None
+        name = shell.decode(proc.stdout).strip()
+        return name or None
 
-def is_rebase_in_progress(repo_dir: Path | None = None) -> bool:
-    """Check if a rebase operation is currently in progress.
+    def current_branch_ref(self) -> str | None:
+        """``refs/heads/<branch>`` for the checked out branch, None if detached."""
+        proc = self.run("symbolic-ref", "--quiet", "HEAD", check=False)
+        if proc.returncode != 0:
+            return None
+        return shell.decode(proc.stdout).strip()
 
-    Args:
-        repo_dir: path to the repo. Defaults to the current working directory.
+    def merge_base(self, a: str, b: str) -> str:
+        proc = self.run("merge-base", a, b, check=False)
+        if proc.returncode != 0:
+            raise PstackError(f"'{a}' and '{b}' have no common ancestor")
+        return shell.decode(proc.stdout).strip()
 
-    Returns:
-        True if a rebase is in progress, False otherwise.
-    """
-    git_dir = Path(".git") if repo_dir is None else repo_dir / ".git"
-    return (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
+    def is_ancestor(self, a: str, b: str) -> bool:
+        proc = self.run("merge-base", "--is-ancestor", a, b, check=False)
+        if proc.returncode not in (0, 1):
+            raise shell.CommandError(
+                ["git", "merge-base", "--is-ancestor", a, b],
+                proc.returncode,
+                shell.decode(proc.stdout),
+                shell.decode(proc.stderr),
+            )
+        return proc.returncode == 0
+
+    def rev_list(self, base: str, head: str) -> list[str]:
+        """Commits in ``base..head``, oldest first."""
+        out = self.output("rev-list", "--reverse", f"^{base}", head)
+        return out.split() if out else []
+
+    # -- objects ---------------------------------------------------------------
+
+    def read_commits(self, shas: Sequence[str]) -> list[Commit]:
+        if not shas:
+            return []
+        proc = self.run("cat-file", "--batch", input="\n".join(shas) + "\n")
+        data = proc.stdout
+        commits: list[Commit] = []
+        pos = 0
+        for sha in shas:
+            nl = data.index(b"\n", pos)
+            header = data[pos:nl].decode("ascii").split()
+            pos = nl + 1
+            if len(header) != 3 or header[1] != "commit":  # noqa: PLR2004
+                raise PstackError(f"{sha} is not a commit object")
+            size = int(header[2])
+            commits.append(Commit.parse(header[0], data[pos : pos + size]))
+            pos += size + 1  # skip the trailing newline
+        return commits
+
+    def read_commit(self, sha: str) -> Commit:
+        return self.read_commits([sha])[0]
+
+    def commit_tree(
+        self,
+        *,
+        tree: str,
+        parents: Sequence[str],
+        author: Identity,
+        committer: Identity,
+        message: str,
+        encoding: str | None = None,
+    ) -> str:
+        """Create a commit object; nothing points at it until a ref is updated.
+
+        ``encoding`` reproduces a commit's ``encoding`` header; without it git
+        would re-encode a non-UTF-8 message.
+        """
+        args = []
+        if encoding:
+            args += ["-c", f"i18n.commitEncoding={encoding}"]
+        args += ["commit-tree", tree]
+        for parent in parents:
+            args += ["-p", parent]
+        args += ["-F", "-"]
+        env = {**author.env("AUTHOR"), **committer.env("COMMITTER")}
+        return self.output(*args, input=message, env=env)
+
+    def rewrite(self, commit: Commit, *, parents: Sequence[str], message: str) -> str:
+        """Return a commit like ``commit`` but with new parents and message.
+
+        The sha of ``commit`` itself is returned when nothing would change, so
+        the operation is idempotent.
+        """
+        if tuple(parents) == commit.parents and message == commit.message:
+            return commit.sha
+        return self.commit_tree(
+            tree=commit.tree,
+            parents=parents,
+            author=commit.author,
+            committer=commit.committer,
+            message=message,
+            encoding=commit.encoding,
+        )
+
+    # -- refs ------------------------------------------------------------------
+
+    def for_each_ref(self, *patterns: str) -> dict[str, str]:
+        """Map of full ref name to sha for refs matching ``patterns``."""
+        out = self.output(
+            "for-each-ref", "--format=%(refname) %(objectname)", *patterns
+        )
+        refs: dict[str, str] = {}
+        for line in out.splitlines():
+            name, _, sha = line.partition(" ")
+            refs[name] = sha
+        return refs
+
+    def update_refs(self, updates: Sequence[RefUpdate], *, message: str) -> None:
+        """Apply all ``updates`` in one transaction, or none of them.
+
+        Each update requires the ref to still have its expected old value.
+        """
+        if not updates:
+            return
+        script = ["start"]
+        script += [f"update {u.ref} {u.new} {u.old}" for u in updates]
+        script += ["prepare", "commit", ""]
+        self.run("update-ref", "-m", message, "--stdin", input="\n".join(script))
+
+    # -- remotes ---------------------------------------------------------------
+
+    def fetch(self, remote: str) -> None:
+        self.run("fetch", "--prune", "--quiet", remote)
+
+    def push(
+        self, remote: str, refs: Sequence[PushRef], *, atomic: bool = True
+    ) -> None:
+        if not refs:
+            return
+        args = ["push", "--quiet"]
+        if atomic:
+            args.append("--atomic")
+        refspecs = []
+        for ref in refs:
+            if ref.expect is None:
+                # A leading '+' forces just this refspec; a global --force would
+                # also disable the leases of the other refs in the same push.
+                refspecs.append(f"+{ref.refspec}")
+            else:
+                args.append(f"--force-with-lease={ref.dst}:{ref.expect}")
+                refspecs.append(ref.refspec)
+        self.run(*args, remote, *refspecs)
