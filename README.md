@@ -17,8 +17,7 @@ uvx --from git+https://github.com/georgekarpenkov/stack-pr pstack-pr export -n  
 uvx --from git+https://github.com/georgekarpenkov/stack-pr pstack-pr export      # do it
 ```
 
-Once the package is on PyPI this becomes `uvx pstack-pr export`. For a
-persistent `pstack-pr` command:
+For a persistent `pstack-pr` command:
 
 ```sh
 uv tool install git+https://github.com/georgekarpenkov/stack-pr

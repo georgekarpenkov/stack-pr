@@ -38,6 +38,8 @@
   dependencies. Added an offline end-to-end test harness with a fake `gh` and
   a bare repository standing in for GitHub, plus opt-in integration tests
   (`--integration`).
+* Removed the PyPI release workflow; the package is not published to PyPI.
+  Install it from git with `uv tool install` or run it with `uvx --from`.
 
 # Version 0.1.3
 
