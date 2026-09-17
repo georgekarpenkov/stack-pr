@@ -331,8 +331,48 @@ class Git:
 
     # -- remotes ---------------------------------------------------------------
 
-    def fetch(self, remote: str) -> None:
-        self.run("fetch", "--prune", "--quiet", remote)
+    def ls_remote(self, remote: str, patterns: Sequence[str]) -> dict[str, str]:
+        """Map of full ref name to sha for branches of ``remote`` matching ``patterns``.
+
+        Asks the remote directly and transfers no objects. ``--heads`` makes the
+        server advertise branches only (not tags or ``refs/pull/*``), which is
+        what keeps this cheap on busy repositories. Patterns are globs matched
+        against the tail of the ref name (``refs/heads/x`` or ``refs/heads/x/*``).
+        """
+        if not patterns:
+            return {}
+        out = self.output("ls-remote", "--heads", "--refs", remote, *patterns)
+        refs: dict[str, str] = {}
+        for line in out.splitlines():
+            sha, _, name = line.partition("\t")
+            if name:
+                refs[name] = sha
+        return refs
+
+    def fetch_branch(self, remote: str, branch: str) -> bool:
+        """Fetch one branch of ``remote`` into its remote-tracking ref.
+
+        The explicit refspec makes git ask the server for that single ref, so
+        this costs one round trip however many branches the remote has, and an
+        empty pack when the branch is already up to date locally. Returns False
+        if the remote has no such branch.
+        """
+        args = [
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            remote,
+            f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}",
+        ]
+        proc = self.run(*args, check=False)
+        if proc.returncode == 0:
+            return True
+        stderr = shell.decode(proc.stderr)
+        if "couldn't find remote ref" in stderr:
+            return False
+        raise shell.CommandError(
+            ["git", *args], proc.returncode, shell.decode(proc.stdout), stderr
+        )
 
     def push(
         self, remote: str, refs: Sequence[PushRef], *, atomic: bool = True

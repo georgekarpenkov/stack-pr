@@ -13,17 +13,17 @@ Nothing to install; [uv](https://docs.astral.sh/uv/) fetches the tool and a
 Python for it:
 
 ```sh
-uvx --from git+https://github.com/georgekarpenkov/stack-pr@v0.2.1 pstack-pr export -n   # preview
-uvx --from git+https://github.com/georgekarpenkov/stack-pr@v0.2.1 pstack-pr export      # do it
+uvx --from git+https://github.com/georgekarpenkov/stack-pr@v0.2.2 pstack-pr export -n   # preview
+uvx --from git+https://github.com/georgekarpenkov/stack-pr@v0.2.2 pstack-pr export      # do it
 ```
 
 For a persistent `pstack-pr` command:
 
 ```sh
-uv tool install git+https://github.com/georgekarpenkov/stack-pr@v0.2.1
+uv tool install git+https://github.com/georgekarpenkov/stack-pr@v0.2.2
 ```
 
-`v0.2.1` is the latest release tag; see [CHANGELOG.md](CHANGELOG.md).
+`v0.2.2` is the latest release tag; see [CHANGELOG.md](CHANGELOG.md).
 
 Requirements: `git`, and the GitHub CLI [`gh`](https://cli.github.com/) logged
 in (`gh auth login`). Python is handled by uv.
@@ -63,11 +63,17 @@ the new bottom PR to `main` and updates the rest. Repeat for each PR.
 
 ## What export does
 
-Planning is read-only apart from `git fetch`: the stack is the linear range
-from the merge base of `HEAD` and `origin/main` to `HEAD`, each commit is
+Planning is read-only apart from a fetch of the target branch alone (an
+explicit refspec, so the server sends just that ref and an empty pack when
+nothing changed). The stack branches are looked up with one `git ls-remote
+--heads` for exactly the names in the commits, plus the name template's
+pattern when a new branch must be allocated. Other remote branches are never
+fetched, so the cost does not grow with the number of branches or pull
+requests in the repository. The stack is the linear range
+from the merge base of `HEAD` and `origin/main` to `HEAD`; each commit is
 mapped to a branch (from its `stack-info:` trailer, or a remote branch whose
-tip is that exact commit, or a fresh `<user>/stack/N`) and its existing PR is
-looked up. `--dry-run` prints the resulting plan and stops; `-v` prints it and
+tip is that exact commit, or a fresh `<user>/stack/N`) and all existing PRs
+are looked up in a single GraphQL request. `--dry-run` prints the resulting plan and stops; `-v` prints it and
 then shows each step as it runs; by default only the result is printed. The
 steps run in this order:
 
@@ -90,7 +96,7 @@ steps run in this order:
 A first export of three commits looks like this with `--dry-run`:
 
 ```
-Fetching origin...
+Contacting origin...
 Stack of 3 commits on feature (base: origin/main @ 1a2b3c4d)
    3  a082cd30  new PR  alice/stack/3  Add c
    2  5e6f7a8b  new PR  alice/stack/2  Add b
@@ -159,7 +165,9 @@ as it runs, `-vv` for every `git` and `gh` command.
   the commits, export refuses to run, because nothing local could record the
   `stack-info:` trailers and every re-run would create new PRs.
 - A re-export with nothing to do makes no write calls to git or GitHub. PRs are
-  only edited when their title, description or base actually differs.
+  only edited when their title, description or base actually differs. Commits
+  that did not change cost nothing: no fetch, no push, no rewrite, no PR edit;
+  the PR lookups for the whole stack are one request.
 - When commits are reordered, a PR whose base branch now sits above it would
   be auto-closed by GitHub the moment the branches are pushed. Such PRs are
   temporarily retargeted to `main` and marked draft, then restored. While a PR

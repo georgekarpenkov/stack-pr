@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -80,7 +81,12 @@ def parse_flags(argv: list[str]) -> tuple[list[str], dict[str, list[str]]]:
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg.startswith("--"):
+        if arg in ("-f", "-F"):
+            # gh api field: -f key=value
+            i += 1
+            key, _, value = argv[i].partition("=")
+            flags.setdefault(key, []).append(value)
+        elif arg.startswith("--"):
             name = arg[2:]
             if "=" in name:
                 name, value = name.split("=", 1)
@@ -105,6 +111,9 @@ def to_json(pr: dict[str, Any], fields: str) -> dict[str, Any]:
 
 def cmd_api(state: State, args: list[str]) -> None:
     positional, flags = parse_flags(args)
+    if positional[:1] == ["graphql"]:
+        graphql(state, flags)
+        return
     if positional[:1] == ["user"]:
         login = os.environ.get("FAKE_GH_USER", "testbot")
         if flags.get("jq") == [".login"]:
@@ -113,6 +122,40 @@ def cmd_api(state: State, args: list[str]) -> None:
             print(json.dumps({"login": login}))
         return
     die(f"fake gh: unsupported api call {args}")
+
+
+def graphql(state: State, flags: dict[str, list[str]]) -> None:
+    """Answer the batched pull request lookup the tool sends.
+
+    Only the shape ``alias: pullRequest(number: N) { fields }`` is understood.
+    Like gh, a missing pull request produces a payload with ``errors`` and a
+    non-zero exit status.
+    """
+    query = flags["query"][0]
+    wanted = re.findall(r"(\w+): pullRequest\(number: (\d+)\)", query)
+    fields_match = re.search(r"pullRequest\(number: \d+\) \{ ([^}]*) \}", query)
+    fields = fields_match.group(1).split() if fields_match else []
+    data: dict[str, Any] = {}
+    errors: list[dict[str, Any]] = []
+    for alias, number in wanted:
+        pr = state.prs.get(number)
+        if pr is None:
+            data[alias] = None
+            errors.append(
+                {
+                    "type": "NOT_FOUND",
+                    "path": ["repository", alias],
+                    "message": f"Could not resolve to a PullRequest with the number of {number}.",
+                }
+            )
+        else:
+            data[alias] = {f: pr[f] for f in fields if f in pr}
+    payload: dict[str, Any] = {"data": {"repository": data}}
+    if errors:
+        payload["errors"] = errors
+        print(json.dumps(payload))
+        die("gh: " + " ".join(e["message"] for e in errors))
+    print(json.dumps(payload))
 
 
 def cmd_pr(state: State, args: list[str]) -> None:

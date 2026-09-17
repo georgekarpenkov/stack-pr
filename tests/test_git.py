@@ -122,6 +122,27 @@ def object_count(work: Work) -> int:
     return len(out.splitlines())
 
 
+def has_commit(work: Work, sha: str) -> bool:
+    """Whether the commit object ``sha`` is in ``work``'s object store.
+
+    Decided by the exit status of ``git cat-file -e``, which prints nothing on
+    success, so the answer cannot be confused with an empty stdout.
+    """
+    proc = subprocess.run(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+        cwd=work.path,
+        capture_output=True,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def remote_tags(remote: Remote) -> set[str]:
+    """Full names of the tags that exist on the bare remote."""
+    out = git("for-each-ref", "refs/tags/", "--format=%(refname)", cwd=remote.path)
+    return set(out.splitlines())
+
+
 def push_from_other_clone(remote: Remote, tmp_path: Path, branch: str) -> str:
     """Commit on ``branch`` in a second clone and push it; returns the new sha."""
     other = tmp_path / "other"
@@ -150,6 +171,29 @@ def record_runs(monkeypatch: pytest.MonkeyPatch) -> list[RunCall]:
         return subprocess.CompletedProcess(["git", *args], 0, b"", b"")
 
     monkeypatch.setattr(Git, "run", fake_run)
+    return calls
+
+
+def record_commands(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Replace ``Git.run`` and ``Git.output`` with recorders; returns the args.
+
+    Unlike :func:`record_runs` this also catches commands issued through
+    ``Git.output`` (``ls-remote``, ``for-each-ref``, ...).
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(
+        _self: Git, *args: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append(list(args))
+        return subprocess.CompletedProcess(["git", *args], 0, b"", b"")
+
+    def fake_output(_self: Git, *args: str, **kwargs: Any) -> str:
+        calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(Git, "run", fake_run)
+    monkeypatch.setattr(Git, "output", fake_output)
     return calls
 
 
@@ -1213,57 +1257,399 @@ def test_update_refs_command_line(
 
 
 # --------------------------------------------------------------------------- #
-# Fetching
+# Remote refs without fetching (ls-remote)
 # --------------------------------------------------------------------------- #
-def test_fetch_updates_remote_tracking_refs(
-    remote: Remote, tmp_path: Path, g: Git
+def create_remote_branches(work: Work, branches: dict[str, str]) -> None:
+    """Create ``branches`` (name -> sha) on the remote by pushing from ``work``."""
+    work.git(
+        "push",
+        "-q",
+        "origin",
+        *(f"{sha}:refs/heads/{name}" for name, sha in branches.items()),
+    )
+
+
+def test_ls_remote_exact_ref(
+    work: Work, remote: Remote, g: Git, stack3: list[str]
 ) -> None:
-    topic = push_from_other_clone(remote, tmp_path, "topic")
-    assert remote.sha("topic") == topic
-    assert g.for_each_ref("refs/remotes/origin/topic") == {}
-    g.fetch("origin")
-    assert g.for_each_ref("refs/remotes/origin/topic") == {
-        "refs/remotes/origin/topic": topic
+    # Similar names must not match an exact pattern.
+    create_remote_branches(work, {"maintenance": stack3[0], "main2": stack3[1]})
+    assert g.ls_remote("origin", ["refs/heads/main"]) == {
+        "refs/heads/main": remote.sha("main")
+    }
+    assert g.ls_remote("origin", [BR_X]) == {}
+
+
+def test_ls_remote_glob_returns_only_matching_refs(
+    work: Work, g: Git, stack3: list[str]
+) -> None:
+    create_remote_branches(
+        work,
+        {
+            "u/stack/1": stack3[0],
+            "u/stack/2": stack3[1],
+            "u/other": stack3[2],
+            "u/stack-old": stack3[2],
+            "other/u/stack/3": stack3[2],
+        },
+    )
+    assert g.ls_remote("origin", ["refs/heads/u/stack/*"]) == {
+        "refs/heads/u/stack/1": stack3[0],
+        "refs/heads/u/stack/2": stack3[1],
     }
 
 
-def test_fetch_updates_moved_main_but_not_local_branches(
+def test_ls_remote_several_patterns_in_one_call(
+    work: Work, remote: Remote, g: Git, stack3: list[str]
+) -> None:
+    create_remote_branches(
+        work, {"u/stack/1": stack3[0], "u/stack/2": stack3[1], "u/other": stack3[2]}
+    )
+    refs = g.ls_remote(
+        "origin", ["refs/heads/main", "refs/heads/u/stack/*", "refs/heads/nope"]
+    )
+    assert refs == {
+        "refs/heads/main": remote.sha("main"),
+        "refs/heads/u/stack/1": stack3[0],
+        "refs/heads/u/stack/2": stack3[1],
+    }
+
+
+def test_ls_remote_no_match_is_empty(g: Git) -> None:
+    assert g.ls_remote("origin", ["refs/heads/nope"]) == {}
+    assert g.ls_remote("origin", ["refs/heads/nothing/*"]) == {}
+    assert g.ls_remote("origin", ["refs/heads/nope", "refs/heads/nothing/*"]) == {}
+
+
+def test_ls_remote_never_returns_head_or_tags(
+    work: Work, remote: Remote, g: Git, stack3: list[str]
+) -> None:
+    work.git("tag", "-a", "-m", "release", "v1", stack3[1])
+    work.git("tag", "light", stack3[0])
+    work.git("push", "-q", "origin", "refs/tags/v1", "refs/tags/light")
+    assert remote_tags(remote) == {"refs/tags/v1", "refs/tags/light"}
+    # ``--heads``: the server advertises branches only, so a tag-only pattern
+    # is empty (and no peeled ``refs/tags/v1^{}`` entry can show up either),
+    # whether the tag is named in full or matched by its tail.
+    assert g.ls_remote("origin", ["refs/tags/*"]) == {}
+    assert g.ls_remote("origin", ["refs/tags/v1", "refs/tags/light"]) == {}
+    assert g.ls_remote("origin", ["v1", "light"]) == {}
+    assert g.ls_remote("origin", ["HEAD"]) == {}
+    # Branches are unaffected by the presence of tags.
+    assert g.ls_remote("origin", ["refs/heads/main", "refs/tags/*", "HEAD"]) == {
+        "refs/heads/main": remote.sha("main")
+    }
+
+
+def test_ls_remote_branch_and_tag_with_the_same_name_returns_only_the_branch(
+    work: Work, g: Git, stack3: list[str]
+) -> None:
+    create_remote_branches(work, {"release": stack3[2]})
+    work.git("tag", "release", stack3[0])
+    work.git("push", "-q", "origin", "refs/tags/release")
+    # A tail pattern matches both refs on the server; only the branch is
+    # advertised with ``--heads``.
+    assert g.ls_remote("origin", ["release"]) == {"refs/heads/release": stack3[2]}
+    assert g.ls_remote("origin", ["refs/heads/release", "refs/tags/release"]) == {
+        "refs/heads/release": stack3[2]
+    }
+    assert g.ls_remote("origin", ["refs/tags/release"]) == {}
+
+
+def test_ls_remote_empty_patterns_makes_no_git_call(
+    g: Git, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = record_commands(monkeypatch)
+    assert g.ls_remote("origin", []) == {}
+    assert g.ls_remote("nope", []) == {}
+    assert calls == []
+
+
+def test_ls_remote_unknown_remote_raises_command_error(g: Git) -> None:
+    with pytest.raises(CommandError) as excinfo:
+        g.ls_remote("nope", ["refs/heads/main"])
+    assert excinfo.value.cmd == [
+        "git",
+        "ls-remote",
+        "--heads",
+        "--refs",
+        "nope",
+        "refs/heads/main",
+    ]
+    assert excinfo.value.returncode == 128
+
+
+def test_ls_remote_works_through_insteadof(work: Work, remote: Remote, g: Git) -> None:
+    # origin's configured URL is a GitHub one; git rewrites it to the bare
+    # repository, and ls-remote goes through the same rewrite as fetch/push.
+    assert g.remote_url("origin") == "git@github.com:octo/widgets.git"
+    assert work.git("remote", "get-url", "origin") == str(remote.path)
+    assert g.ls_remote("origin", ["refs/heads/main"]) == {
+        "refs/heads/main": remote.sha("main")
+    }
+
+
+def test_ls_remote_asks_the_remote_and_transfers_nothing(
+    work: Work, remote: Remote, tmp_path: Path, g: Git
+) -> None:
+    old_main = work.head("origin/main")
+    new_main = push_from_other_clone(remote, tmp_path, "main")
+    topic = push_from_other_clone(remote, tmp_path, "topic")
+    assert new_main != old_main
+    before = object_count(work)
+    refs = g.ls_remote("origin", ["refs/heads/main", "refs/heads/topic"])
+    assert refs == {"refs/heads/main": new_main, "refs/heads/topic": topic}
+    # The answer came from the remote, and nothing was fetched: no objects
+    # arrived and no remote-tracking ref was created or moved.
+    assert work.head("origin/main") == old_main
+    assert g.for_each_ref("refs/remotes/") == {
+        "refs/remotes/origin/HEAD": old_main,
+        "refs/remotes/origin/main": old_main,
+    }
+    assert object_count(work) == before
+    assert has_commit(work, new_main) is False
+    assert has_commit(work, topic) is False
+
+
+def test_ls_remote_deleted_branch_is_absent_despite_stale_tracking_ref(
+    work: Work, remote: Remote, g: Git, stack3: list[str]
+) -> None:
+    g.push("origin", [PushRef(dst=BR_X, src=stack3[0], expect="")])
+    assert g.ls_remote("origin", [BR_X]) == {BR_X: stack3[0]}
+    # Deleted on the remote behind our back; the tracking ref still has it.
+    git("update-ref", "-d", BR_X, cwd=remote.path)
+    assert work.head("origin/testbot/stack/1") == stack3[0]
+    assert g.ls_remote("origin", [BR_X]) == {}
+
+
+def test_ls_remote_command_line(g: Git, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = record_commands(monkeypatch)
+    g.ls_remote("origin", ["refs/heads/main", "refs/heads/master"])
+    g.ls_remote("origin", [BR_X, "refs/heads/testbot/stack/*"])
+    assert calls == [
+        [
+            "ls-remote",
+            "--heads",
+            "--refs",
+            "origin",
+            "refs/heads/main",
+            "refs/heads/master",
+        ],
+        [
+            "ls-remote",
+            "--heads",
+            "--refs",
+            "origin",
+            BR_X,
+            "refs/heads/testbot/stack/*",
+        ],
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Fetching one branch
+# --------------------------------------------------------------------------- #
+def test_fetch_branch_updates_tracking_ref_and_makes_objects_available(
     work: Work, remote: Remote, tmp_path: Path, g: Git, stack3: list[str]
 ) -> None:
     old_main = work.head("origin/main")
     new_main = push_from_other_clone(remote, tmp_path, "main")
     assert new_main != old_main
-    g.fetch("origin")
+    assert has_commit(work, new_main) is False
+    assert g.fetch_branch("origin", "main") is True
     assert work.head("origin/main") == new_main
+    assert g.rev_parse("refs/remotes/origin/main") == new_main
+    assert has_commit(work, new_main) is True
+    fetched = g.read_commit(new_main)
+    assert fetched.title == "Add main"
+    assert fetched.parents == (old_main,)
+    # Local branches and the checkout are untouched.
     assert work.head("main") == old_main
     assert work.head("feature") == stack3[2]
+    assert work.head() == stack3[2]
 
 
-def test_fetch_prunes_deleted_remote_branches(
-    remote: Remote, tmp_path: Path, g: Git
+def test_fetch_branch_does_not_create_other_remote_tracking_refs(
+    work: Work, remote: Remote, tmp_path: Path, g: Git
 ) -> None:
-    push_from_other_clone(remote, tmp_path, "gone")
-    g.fetch("origin")
-    assert "refs/remotes/origin/gone" in g.for_each_ref("refs/remotes/origin/")
-    git("push", "-q", "origin", "--delete", "gone", cwd=tmp_path / "other")
-    g.fetch("origin")
-    assert "refs/remotes/origin/gone" not in g.for_each_ref("refs/remotes/origin/")
+    new_main = push_from_other_clone(remote, tmp_path, "main")
+    topic = push_from_other_clone(remote, tmp_path, "topic")
+    assert remote.sha("topic") == topic
+    assert g.fetch_branch("origin", "main") is True
+    assert g.for_each_ref("refs/remotes/") == {
+        "refs/remotes/origin/HEAD": new_main,
+        "refs/remotes/origin/main": new_main,
+    }
+    assert has_commit(work, topic) is False
 
 
-def test_fetch_unknown_remote_raises_command_error(g: Git) -> None:
-    with pytest.raises(CommandError) as excinfo:
-        g.fetch("nope")
-    assert excinfo.value.cmd == ["git", "fetch", "--prune", "--quiet", "nope"]
-    assert excinfo.value.returncode == 128
+def test_fetch_branch_of_a_stack_branch_creates_only_its_tracking_ref(
+    work: Work, remote: Remote, tmp_path: Path, g: Git
+) -> None:
+    one = push_from_other_clone(remote, tmp_path, "testbot/stack/1")
+    two = push_from_other_clone(remote, tmp_path, "testbot/stack/2")
+    assert g.fetch_branch("origin", "testbot/stack/1") is True
+    assert g.for_each_ref("refs/remotes/origin/testbot/") == {
+        "refs/remotes/origin/testbot/stack/1": one
+    }
+    assert has_commit(work, one) is True
+    assert has_commit(work, two) is False
 
 
-def test_fetch_is_a_noop_when_nothing_changed(
+def test_fetch_branch_does_not_fetch_tags(
+    work: Work, remote: Remote, tmp_path: Path, g: Git
+) -> None:
+    new_main = push_from_other_clone(remote, tmp_path, "main")
+    other = tmp_path / "other"
+    git("tag", "-a", "-m", "release", "v1", new_main, cwd=other)
+    git("tag", "light", new_main, cwd=other)
+    git("push", "-q", "origin", "refs/tags/v1", "refs/tags/light", cwd=other)
+    assert remote_tags(remote) == {"refs/tags/v1", "refs/tags/light"}
+    assert g.fetch_branch("origin", "main") is True
+    assert work.head("origin/main") == new_main
+    # Both tags point at the commit just fetched; without --no-tags git would
+    # auto-follow them.
+    assert g.for_each_ref("refs/tags/") == {}
+
+
+def test_fetch_branch_force_updates_after_remote_history_rewrite(
+    work: Work, remote: Remote, tmp_path: Path, g: Git
+) -> None:
+    c0 = work.head("origin/main")
+    c1 = push_from_other_clone(remote, tmp_path, "main")
+    assert g.fetch_branch("origin", "main") is True
+    assert work.head("origin/main") == c1
+    # main is force-pushed to a commit that does not descend from c1.
+    other = tmp_path / "other"
+    git("reset", "-q", "--hard", c0, cwd=other)
+    (other / "rewritten.txt").write_text("rewritten\n")
+    git("add", "rewritten.txt", cwd=other)
+    git("commit", "-q", "-m", "Rewritten main", cwd=other)
+    c2 = git("rev-parse", "HEAD", cwd=other)
+    git("push", "-q", "--force", "origin", "HEAD:refs/heads/main", cwd=other)
+    assert remote.sha("main") == c2
+    assert g.fetch_branch("origin", "main") is True
+    assert work.head("origin/main") == c2
+    assert g.is_ancestor(c1, c2) is False
+    assert g.read_commit(c2).parents == (c0,)
+
+
+def test_fetch_branch_is_a_noop_when_nothing_changed(
     work: Work, g: Git, stack3: list[str]
 ) -> None:
     before = g.for_each_ref()
-    g.fetch("origin")
+    count = object_count(work)
+    assert g.fetch_branch("origin", "main") is True
     assert g.for_each_ref() == before
+    assert object_count(work) == count
     assert work.head() == stack3[2]
+
+
+@pytest.mark.parametrize("branch", ["nope", "testbot/stack/9", "main2"])
+def test_fetch_branch_unknown_branch_returns_false_and_creates_no_ref(
+    work: Work, g: Git, stack3: list[str], branch: str
+) -> None:
+    before = g.for_each_ref()
+    count = object_count(work)
+    assert g.fetch_branch("origin", branch) is False
+    assert g.for_each_ref(f"refs/remotes/origin/{branch}") == {}
+    assert g.for_each_ref() == before
+    assert object_count(work) == count
+    assert work.head() == stack3[2]
+
+
+def test_fetch_branch_of_a_branch_deleted_on_the_remote_returns_false(
+    work: Work, remote: Remote, g: Git, stack3: list[str]
+) -> None:
+    g.push("origin", [PushRef(dst=BR_X, src=stack3[0], expect="")])
+    assert g.fetch_branch("origin", "testbot/stack/1") is True
+    git("update-ref", "-d", BR_X, cwd=remote.path)
+    assert remote.sha("testbot/stack/1") is None
+    assert g.fetch_branch("origin", "testbot/stack/1") is False
+    # git does not prune with an explicit refspec: the stale tracking ref is
+    # left alone, which is why the tool never reads branch state from it.
+    assert work.head("origin/testbot/stack/1") == stack3[0]
+
+
+def test_fetch_branch_unknown_remote_raises_command_error(g: Git) -> None:
+    before = g.for_each_ref()
+    with pytest.raises(CommandError) as excinfo:
+        g.fetch_branch("nope", "main")
+    err = excinfo.value
+    assert err.returncode == 128
+    assert err.cmd[:2] == ["git", "fetch"]
+    assert "nope" in err.cmd
+    assert "couldn't find remote ref" not in err.stderr
+    assert "nope" in err.stderr
+    assert g.for_each_ref("refs/remotes/nope/") == {}
+    assert g.for_each_ref() == before
+
+
+def test_fetch_branch_unknown_remote_is_not_mistaken_for_a_missing_branch(
+    work: Work, g: Git
+) -> None:
+    # A remote that exists but cannot be reached must not look like "the
+    # branch is missing": that would make the tool report a wrong cause.
+    work.git("remote", "add", "broken", str(work.path / "does-not-exist.git"))
+    with pytest.raises(CommandError) as excinfo:
+        g.fetch_branch("broken", "main")
+    assert excinfo.value.returncode == 128
+    assert g.for_each_ref("refs/remotes/broken/") == {}
+
+
+def test_fetch_branch_only_a_missing_remote_ref_means_false(
+    g: Git, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The return value is decided by git's stderr, not by the exit code alone."""
+
+    def failing_with(stderr: bytes) -> Any:
+        def fake_run(
+            _self: Git, *args: str, **kwargs: Any
+        ) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.CompletedProcess(["git", *args], 128, b"", stderr)
+
+        return fake_run
+
+    monkeypatch.setattr(
+        Git, "run", failing_with(b"fatal: couldn't find remote ref refs/heads/nope\n")
+    )
+    assert g.fetch_branch("origin", "nope") is False
+
+    unreachable = b"fatal: 'nope' does not appear to be a git repository\n"
+    monkeypatch.setattr(Git, "run", failing_with(unreachable))
+    with pytest.raises(CommandError) as excinfo:
+        g.fetch_branch("nope", "main")
+    assert excinfo.value.returncode == 128
+    assert excinfo.value.stderr == shell.decode(unreachable)
+    assert excinfo.value.cmd[:2] == ["git", "fetch"]
+
+
+def test_fetch_branch_command_line(g: Git, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = record_runs(monkeypatch)
+    assert g.fetch_branch("origin", "main") is True
+    assert g.fetch_branch("upstream", "testbot/stack/1") is True
+    assert calls == [
+        (
+            [
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+            None,
+        ),
+        (
+            [
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "upstream",
+                "+refs/heads/testbot/stack/1:refs/remotes/upstream/testbot/stack/1",
+            ],
+            None,
+        ),
+    ]
 
 
 # --------------------------------------------------------------------------- #

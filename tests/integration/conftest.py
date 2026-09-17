@@ -9,7 +9,10 @@ environment taken when this module is imported (i.e. before any fixture ran).
 The scratch repository is ``georgekarpenkov/pstack-pr-test`` unless
 ``PSTACK_PR_TEST_REPO`` says otherwise. Every run works on branches named
 ``itest/<runid>/<n>`` with a fresh ``runid`` and removes its pull requests and
-branches again at the end of the session.
+branches again at the end of the session. The cleanup deletes *every* remote
+branch under ``itest/<runid>/``, so branches pushed from the :func:`second_clone`
+(``itest/<runid>/unrelated``) are covered as well. Nothing ever pushes to
+``main`` of the scratch repository: other runs depend on it.
 """
 
 from __future__ import annotations
@@ -124,6 +127,9 @@ class GhRepo:
     slug: str
     run_id: str
     env: dict[str, str]
+    # ``refs/remotes/origin/*`` right after the clone, before anything was
+    # pushed; the tool must not add to it apart from the branches it pushes.
+    initial_tracking_refs: frozenset[str] = frozenset()
 
     # -- naming ----------------------------------------------------------------
 
@@ -142,6 +148,14 @@ class GhRepo:
 
     def stack_branch(self, branch_id: int) -> str:
         return f"{self.branch_prefix}{branch_id}"
+
+    @property
+    def unrelated_branch(self) -> str:
+        """A branch of this run that is not part of the stack (pushed elsewhere)."""
+        return f"{self.branch_prefix}unrelated"
+
+    def tracking_ref(self, branch: str) -> str:
+        return f"refs/remotes/origin/{branch}"
 
     def pr_url(self, number: int) -> str:
         return f"https://github.com/{self.slug}/pull/{number}"
@@ -303,6 +317,20 @@ class GhRepo:
     def reflog(self, ref: str = "HEAD") -> list[str]:
         return self.git("reflog", "show", "--format=%gs", ref).splitlines()
 
+    def remote_tracking_refs(self) -> frozenset[str]:
+        """All ``refs/remotes/origin/*`` of the clone (``HEAD`` included)."""
+        out = self.git("for-each-ref", "--format=%(refname)", "refs/remotes/origin/")
+        return frozenset(out.split())
+
+    def has_ref(self, ref: str) -> bool:
+        proc = self.run(["git", "rev-parse", "--verify", "--quiet", ref], check=False)
+        return proc.returncode == 0
+
+    def has_commit(self, sha: str) -> bool:
+        """True if commit ``sha`` exists in the clone's object store."""
+        proc = self.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], check=False)
+        return proc.returncode == 0
+
 
 def cleanup(repo: GhRepo) -> None:
     """Close this run's pull requests and delete its remote branches.
@@ -391,11 +419,47 @@ def gh_repo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[GhRepo]:
     # The try/finally starts before anything reaches the remote, so the cleanup
     # runs even when the rest of the set-up or any test fails.
     try:
-        repo.git("config", "user.name", "pstack-pr integration test")
-        repo.git("config", "user.email", "pstack-pr-itest@example.com")
+        _configure_identity(repo)
         repo.git("checkout", "--quiet", "-b", repo.branch, "origin/main")
+        repo.initial_tracking_refs = repo.remote_tracking_refs()
+        assert repo.tracking_ref("main") in repo.initial_tracking_refs
         assert repo.remote_branches() == {}, "stale branches from another run"
         print(f"\n[integration] repo {slug}, run {run_id}, clone at {path}")
         yield repo
     finally:
         cleanup(repo)
+
+
+def _configure_identity(repo: GhRepo) -> None:
+    repo.git("config", "user.name", "pstack-pr integration test")
+    repo.git("config", "user.email", "pstack-pr-itest@example.com")
+
+
+@pytest.fixture(scope="session")
+def second_clone(gh_repo: GhRepo) -> GhRepo:
+    """Another clone of the scratch repository, sharing the run id.
+
+    Used to push commits that the first clone has never seen, to prove that the
+    tool fetches nothing but the target branch. Branches it pushes must live
+    under the run's prefix (see :attr:`GhRepo.unrelated_branch`), which is what
+    the session cleanup of ``gh_repo`` deletes.
+    """
+    path = gh_repo.path.parent / "clone2"
+    proc = subprocess.run(
+        ["git", "clone", "--quiet", f"git@github.com:{gh_repo.slug}.git", str(path)],
+        cwd=gh_repo.path.parent,
+        env=gh_repo.env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=COMMAND_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        pytest.fail(
+            f"cannot clone git@github.com:{gh_repo.slug}.git again:\n{proc.stderr}"
+        )
+    clone = GhRepo(path=path, slug=gh_repo.slug, run_id=gh_repo.run_id, env=gh_repo.env)
+    _configure_identity(clone)
+    # Work on a local branch so that nothing can end up on main by accident.
+    clone.git("checkout", "--quiet", "-b", f"unrelated-{clone.run_id}", "origin/main")
+    return clone

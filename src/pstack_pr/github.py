@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from pstack_pr import shell
 from pstack_pr.errors import PstackError
+from pstack_pr.shell import CommandError
 
 # scp-like syntax: [user@]host:owner/repo(.git)
 _SCP_URL_RE = re.compile(r"^(?:[\w.-]+@)?(?P<host>[\w.-]+):(?P<path>[^/:].*)$")
@@ -21,6 +22,9 @@ _URL_RE = re.compile(
 _HOST_ALIASES = {"ssh.github.com": "github.com"}
 
 PR_JSON_FIELDS = "number,url,state,isDraft,title,body,baseRefName,headRefName"
+PR_GRAPHQL_FIELDS = PR_JSON_FIELDS.replace(",", " ")
+# Pull requests looked up per GraphQL request; well below GitHub's node limits.
+GRAPHQL_BATCH_SIZE = 50
 
 
 @dataclass(frozen=True)
@@ -112,6 +116,24 @@ def check_gh_installed() -> None:
         )
 
 
+def _graphql_failure(error: CommandError, repo: Repo) -> str:
+    """A readable message for a failed ``gh api graphql`` call."""
+    messages: list[str] = []
+    try:
+        payload = json.loads(error.stdout or "{}")
+    except ValueError:
+        payload = {}
+    for item in payload.get("errors") or []:
+        if isinstance(item, dict) and item.get("message"):
+            messages.append(str(item["message"]))
+    if messages:
+        return (
+            f"GitHub rejected the pull request lookup in {repo.url}:\n  "
+            + "\n  ".join(messages)
+        )
+    return str(error)
+
+
 class GitHub:
     """Operations on pull requests of one repository."""
 
@@ -147,6 +169,52 @@ class GitHub:
             PR_JSON_FIELDS,
         )
         return PullRequest.from_json(json.loads(out))
+
+    def view_prs(self, numbers: Sequence[int]) -> dict[int, PullRequest]:
+        """Look up many pull requests by number with one request per 50.
+
+        Unlike one ``gh pr view`` per PR this costs a single round trip for a
+        whole stack. A number that does not exist in the repository is an
+        error.
+        """
+        prs: dict[int, PullRequest] = {}
+        for start in range(0, len(numbers), GRAPHQL_BATCH_SIZE):
+            prs.update(
+                self._view_prs_batch(numbers[start : start + GRAPHQL_BATCH_SIZE])
+            )
+        return prs
+
+    def _view_prs_batch(self, numbers: Sequence[int]) -> dict[int, PullRequest]:
+        selections = " ".join(
+            f"pr{n}: pullRequest(number: {n}) {{ {PR_GRAPHQL_FIELDS} }}"
+            for n in numbers
+        )
+        query = (
+            "query($owner: String!, $name: String!) { "
+            f"repository(owner: $owner, name: $name) {{ {selections} }} }}"
+        )
+        try:
+            out = self._gh(
+                "api", "--hostname", self.repo.host, "graphql",
+                "-f", f"query={query}",
+                "-f", f"owner={self.repo.owner}",
+                "-f", f"name={self.repo.name}",
+            )  # fmt: skip
+        except CommandError as e:
+            raise PstackError(_graphql_failure(e, self.repo)) from e
+        data = json.loads(out or "{}")
+        repository = (data.get("data") or {}).get("repository")
+        if not isinstance(repository, dict):
+            raise PstackError(f"repository {self.repo.slug} was not found on GitHub")
+        prs: dict[int, PullRequest] = {}
+        for n in numbers:
+            node = repository.get(f"pr{n}")
+            if not isinstance(node, dict):
+                raise PstackError(
+                    f"pull request #{n} does not exist in {self.repo.url}"
+                )
+            prs[n] = PullRequest.from_json(node)
+        return prs
 
     def find_open_pr(self, head: str) -> PullRequest | None:
         """The open pull request whose head branch is ``head``, if any."""

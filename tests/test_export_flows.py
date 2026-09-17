@@ -6,8 +6,9 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
-from tests.conftest import FakeGitHub, RunExport, Work
+from tests.conftest import FakeGitHub, Remote, RunExport, Work, git
 
 REPO_URL = "https://github.com/octo/widgets"
 REPO_SLUG = "github.com/octo/widgets"  # what every ``gh --repo`` receives
@@ -293,7 +294,8 @@ def test_fresh_export_prints_only_the_result_block_by_default(
 
     assert rc == 0
     assert err == ""
-    # No fetch notice, stack table, plan or progress lines: just the outcome.
+    # No 'Contacting' notice, stack table, plan or progress lines: just the
+    # outcome.
     assert out == (
         "Exported 3 pull requests (3 new):\n"
         f"   3  #3  new        {REPO_URL}/pull/3  Add c\n"
@@ -304,7 +306,7 @@ def test_fresh_export_prints_only_the_result_block_by_default(
     )
 
 
-def test_fresh_export_verbose_prints_fetch_stack_plan_progress_then_result(
+def test_fresh_export_verbose_prints_contacting_stack_plan_progress_then_result(
     work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
 ) -> None:
     a, b, c = stack3
@@ -314,7 +316,7 @@ def test_fresh_export_verbose_prints_fetch_stack_plan_progress_then_result(
     assert rc == 0
     assert err == ""
     lines = out.splitlines()
-    assert lines[0] == "Fetching origin..."
+    assert lines[0] == "Contacting origin..."
     assert lines[1] == (
         "Stack of 3 commits on feature "
         f"(base: origin/main @ {work.head('origin/main')[:8]})"
@@ -360,6 +362,7 @@ def test_reexport_without_changes_is_a_no_op(
     write_calls = fake_gh.write_calls()
     prs = fake_gh.prs()
     reflog = work.reflog("feature")
+    calls_before = fake_gh.calls()
 
     rc, out, err = run_export("-v")
 
@@ -382,8 +385,12 @@ def test_reexport_without_changes_is_a_no_op(
     assert fake_gh.write_calls() == write_calls
     assert fake_gh.prs() == prs
     assert work.reflog("feature") == reflog
-    # The second run only read: one user lookup and one view per PR.
-    assert len(fake_gh.calls("pr", "view")) == 3
+    # The second run only read, with one batched lookup of all three PRs; every
+    # commit already carries a trailer, so no login lookup was needed either.
+    new_calls = fake_gh.calls()[len(calls_before) :]
+    assert len(new_calls) == 1
+    assert new_calls[0][:4] == ["api", "--hostname", "github.com", "graphql"]
+    assert fake_gh.calls("pr", "view") == []
     assert fake_gh.calls("pr", "list") == []
 
 
@@ -1073,6 +1080,29 @@ def export_in_subprocess(work: Work, *args: str) -> subprocess.CompletedProcess[
     )
 
 
+USER_CALL = ["api", "--hostname", "github.com", "user", "--jq", ".login"]
+GRAPHQL_CALL = ["api", "--hostname", "github.com", "graphql"]
+# The one fetch every export runs: exactly the target branch, into its
+# remote-tracking ref, nothing else (no tags, no other branches).
+FETCH_MAIN = (
+    "$ git fetch --quiet --no-tags origin +refs/heads/main:refs/remotes/origin/main"
+)
+# The one ls-remote for the stack branches: the template glob is only asked
+# for when some commit has no stack-info trailer yet.
+LS_REMOTE_TEMPLATE = (
+    "$ git ls-remote --heads --refs origin 'refs/heads/testbot/stack/*'"
+)
+LS_REMOTE_KNOWN = (
+    "$ git ls-remote --heads --refs origin refs/heads/testbot/stack/1 "
+    "refs/heads/testbot/stack/2 refs/heads/testbot/stack/3"
+)
+
+
+def fetch_lines(proc: subprocess.CompletedProcess[str]) -> list[str]:
+    """Every ``git fetch`` command line a -vv run logged, in order."""
+    return [line for line in proc.stderr.splitlines() if line.startswith("$ git fetch")]
+
+
 def test_double_verbose_logs_git_and_gh_commands_to_stderr(
     work: Work, fake_gh: FakeGitHub, stack3: list[str]
 ) -> None:
@@ -1080,10 +1110,18 @@ def test_double_verbose_logs_git_and_gh_commands_to_stderr(
 
     assert proc.returncode == 0, proc.stderr
     assert "Dry run: nothing was changed." in proc.stdout
-    assert "$ git fetch --prune --quiet origin" in proc.stderr
+    # Every export, a dry run included, refreshes origin/main with exactly one
+    # targeted fetch, then asks the remote about the stack branches once. main
+    # exists, so the 'master' hint is never looked up.
+    assert fetch_lines(proc) == [FETCH_MAIN]
+    assert LS_REMOTE_TEMPLATE in proc.stderr
+    assert proc.stderr.count("$ git ls-remote") == 1
+    assert "refs/heads/master" not in proc.stderr
+    assert proc.stderr.index(FETCH_MAIN) < proc.stderr.index(LS_REMOTE_TEMPLATE)
     assert "$ git " in proc.stderr
     assert "$ gh api --hostname github.com user --jq .login" in proc.stderr
     assert "  [stdout] testbot" in proc.stderr
+    assert "$ git push" not in proc.stderr
     assert "$ git " not in proc.stdout
     assert work.head() == stack3[-1]
     assert fake_gh.write_calls() == []
@@ -1096,7 +1134,7 @@ def test_single_verbose_does_not_log_commands_to_stderr(
 
     assert proc.returncode == 0, proc.stderr
     assert "Dry run: nothing was changed." in proc.stdout
-    assert "Fetching origin..." in proc.stdout
+    assert "Contacting origin..." in proc.stdout
     assert proc.stderr == ""
 
 
@@ -1108,3 +1146,466 @@ def test_without_verbose_nothing_is_logged_to_stderr(
     assert rc == 0
     assert err == ""
     assert "$ git" not in out
+
+
+# --------------------------------------------------------------------------- #
+# 16. selective fetch and batched lookups
+# --------------------------------------------------------------------------- #
+def has_object(work: Work, sha: str) -> bool:
+    """Whether commit ``sha`` is in ``work``'s object store, by exit status."""
+    proc = subprocess.run(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+        cwd=work.path,
+        capture_output=True,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def tracking_refs(work: Work) -> list[str]:
+    """Full names of the remote-tracking refs in ``work``, sorted."""
+    out = work.git("for-each-ref", "--format=%(refname)", "refs/remotes/")
+    return sorted(out.splitlines())
+
+
+def graphql_calls(calls: list[list[str]]) -> list[list[str]]:
+    return [c for c in calls if c[: len(GRAPHQL_CALL)] == GRAPHQL_CALL]
+
+
+def graphql_numbers(call: list[str]) -> list[int]:
+    """The pull request numbers one recorded ``gh api graphql`` call asked for."""
+    query = next(a for a in call if a.startswith("query="))
+    return [int(n) for n in re.findall(r"pullRequest\(number: (\d+)\)", query)]
+
+
+def other_clone(tmp_path: Path, work: Work) -> Path:
+    """A second clone of the bare remote, standing in for another developer."""
+    path = tmp_path / "other"
+    git("clone", "-q", str(work.remote.path), str(path), cwd=tmp_path)
+    return path
+
+
+def commit_in(clone: Path, name: str, message: str) -> str:
+    (clone / name).write_text(f"{name}\n")
+    git("add", name, cwd=clone)
+    git("commit", "-q", "-m", message, cwd=clone)
+    return git("rev-parse", "HEAD", cwd=clone)
+
+
+def test_fresh_export_fetches_main_exactly_once_even_when_already_up_to_date(
+    work: Work, fake_gh: FakeGitHub, stack3: list[str]
+) -> None:
+    main = work.head("origin/main")
+    assert work.remote.sha("main") == main
+    assert has_object(work, main)
+
+    proc = export_in_subprocess(work, "-vv")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "Contacting origin..." in proc.stdout
+    assert "Exported 3 pull requests (3 new):" in proc.stdout
+    # origin/main is refreshed with one fetch of exactly that branch although
+    # its tip is already local: the explicit refspec makes that a single cheap
+    # round trip. No other fetch happens, and no probe of the object store or
+    # ls-remote of the target replaces it.
+    assert fetch_lines(proc) == [FETCH_MAIN]
+    assert work.head("origin/main") == main
+    # Stack branch state comes from one ls-remote, after the fetch. Nothing is
+    # known yet, so only the template's glob is asked for; main exists, so the
+    # 'master' hint is never looked up.
+    assert LS_REMOTE_TEMPLATE in proc.stderr
+    assert proc.stderr.count("$ git ls-remote") == 1
+    assert "refs/heads/master" not in proc.stderr
+    assert proc.stderr.index(FETCH_MAIN) < proc.stderr.index(LS_REMOTE_TEMPLATE)
+    # gh: one login lookup to name the branches, no pull request lookups (none
+    # exist yet) and then only the writes.
+    calls = fake_gh.calls()
+    assert calls[0] == USER_CALL
+    assert calls.count(USER_CALL) == 1
+    assert graphql_calls(calls) == []
+    assert fake_gh.calls("pr", "view") == []
+    assert [c[:2] for c in calls[1:]] == [["pr", "create"]] * 3 + [["pr", "edit"]] * 3
+
+
+def test_reexport_of_unchanged_stack_makes_exactly_one_batched_pr_lookup(
+    work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    run_export()
+    start = len(fake_gh.calls())
+
+    rc, out, err = run_export()
+
+    assert rc == 0
+    assert err == ""
+    assert result_block(out)[0] == "Up to date: 3 pull requests, nothing to push."
+    new_calls = fake_gh.calls()[start:]
+    assert len(new_calls) == 1
+    (lookup,) = new_calls
+    assert lookup[:4] == GRAPHQL_CALL
+    assert lookup[-4:] == ["-f", "owner=octo", "-f", "name=widgets"]
+    assert graphql_numbers(lookup) == [1, 2, 3]
+    # Every commit carries a trailer: no branch name had to be allocated, so
+    # the login was not looked up, and no PR was viewed one by one.
+    assert USER_CALL not in new_calls
+    assert fake_gh.calls("pr", "view") == []
+    assert fake_gh.calls("pr", "list") == []
+
+
+def test_reexport_double_verbose_fetches_main_once_and_asks_for_known_branches(
+    work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    run_export()
+
+    proc = export_in_subprocess(work, "-vv")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "Up to date: 3 pull requests, nothing to push." in proc.stdout
+    # A no-op re-export talks to the remote exactly three times: one targeted
+    # fetch of main, one ls-remote for the branches named in the trailers (no
+    # template glob: no new name has to be allocated) and one batched PR
+    # lookup. No login lookup, no per-PR view, nothing pushed.
+    assert fetch_lines(proc) == [FETCH_MAIN]
+    assert LS_REMOTE_KNOWN in proc.stderr
+    assert "refs/heads/testbot/stack/*" not in proc.stderr
+    assert "refs/heads/master" not in proc.stderr
+    assert proc.stderr.count("$ git ls-remote") == 1
+    assert proc.stderr.index(FETCH_MAIN) < proc.stderr.index(LS_REMOTE_KNOWN)
+    gh_lines = [line for line in proc.stderr.splitlines() if line.startswith("$ gh ")]
+    assert len(gh_lines) == 1
+    assert gh_lines[0].startswith("$ gh api --hostname github.com graphql -f ")
+    assert "$ gh pr view" not in proc.stderr
+    assert "$ gh api --hostname github.com user" not in proc.stderr
+    assert "$ git push" not in proc.stderr
+
+
+def test_export_fetches_only_the_target_branch_when_the_remote_moved(
+    tmp_path: Path, work: Work, fake_gh: FakeGitHub, stack3: list[str]
+) -> None:
+    old_main = work.head("origin/main")
+    other = other_clone(tmp_path, work)
+    git("checkout", "-q", "-b", "unrelated", cwd=other)
+    unrelated = commit_in(other, "unrelated.txt", "Unrelated work")
+    git("push", "-q", "origin", "unrelated", cwd=other)
+    git("checkout", "-q", "main", cwd=other)
+    new_main = commit_in(other, "main.txt", "Advance main")
+    git("push", "-q", "origin", "main", cwd=other)
+    assert work.remote.sha("main") == new_main != old_main
+    assert work.remote.sha("unrelated") == unrelated
+    assert not has_object(work, new_main)
+    assert not has_object(work, unrelated)
+
+    proc = export_in_subprocess(work, "-vv")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "Exported 3 pull requests (3 new):" in proc.stdout
+    # Exactly one fetch, of exactly the target branch: origin/main now has the
+    # new tip and its commit is local...
+    assert fetch_lines(proc) == [FETCH_MAIN]
+    assert work.head("origin/main") == new_main
+    assert has_object(work, new_main)
+    # ...while the unrelated branch was neither fetched nor given a tracking
+    # ref. (The tracking refs of the stack branches are created by git itself
+    # when they are pushed.)
+    assert not has_object(work, unrelated)
+    assert tracking_refs(work) == [
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/testbot/stack/1",
+        "refs/remotes/origin/testbot/stack/2",
+        "refs/remotes/origin/testbot/stack/3",
+    ]
+    # The stack still sits on the old main, so that is its base (the merge
+    # base), even though origin/main itself now points at the new tip.
+    assert f"(base: origin/main @ {old_main[:8]})" in proc.stdout
+    assert work.head("HEAD~3") == old_main
+
+    # Rebased onto the freshly fetched main, the stack has the new tip as its
+    # base. origin/main is refreshed with the same single fetch as always; it
+    # just transfers nothing this time.
+    work.git("rebase", "-q", "origin/main", "feature")
+    assert work.head("HEAD~3") == new_main
+
+    proc = export_in_subprocess(work, "-vv")
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"(base: origin/main @ {new_main[:8]})" in proc.stdout
+    assert fetch_lines(proc) == [FETCH_MAIN]
+    assert work.head("origin/main") == new_main
+    assert "Exported 3 pull requests (3 updated):" in proc.stdout
+    assert (
+        "Branches pushed: testbot/stack/1 (updated), testbot/stack/2 (updated), "
+        "testbot/stack/3 (updated)"
+    ) in proc.stdout
+    assert not has_object(work, unrelated)
+    assert "refs/remotes/origin/unrelated" not in tracking_refs(work)
+
+
+def test_adding_a_commit_looks_up_the_login_once_and_the_prs_in_one_batch(
+    work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    run_export()
+    start = len(fake_gh.calls())
+    d = work.commit("d.txt", "Add d")
+
+    rc, out, err = run_export()
+
+    assert rc == 0
+    assert err == ""
+    new_calls = fake_gh.calls()[start:]
+    # One commit has no trailer, so a branch name is allocated: one login
+    # lookup. The three existing PRs are fetched with one GraphQL request.
+    assert new_calls.count(USER_CALL) == 1
+    lookups = graphql_calls(new_calls)
+    assert len(lookups) == 1
+    assert graphql_numbers(lookups[0]) == [1, 2, 3]
+    assert new_calls[:2] == [USER_CALL, lookups[0]]
+    assert fake_gh.calls("pr", "view") == []
+    assert fake_gh.calls("pr", "list") == []
+    assert [c[:2] for c in new_calls[2:]] == [["pr", "create"]] + [["pr", "edit"]] * 4
+    assert result_block(out) == [
+        "Exported 4 pull requests (1 new, 3 updated):",
+        result_line(4, 4, "new", "Add d"),
+        result_line(3, 3, "updated", "Add c"),
+        result_line(2, 2, "updated", "Add b"),
+        result_line(1, 1, "updated", "Add a"),
+        "Branches pushed: testbot/stack/4 (new)",
+    ]
+    assert work.head() != d
+    assert work.message() == f"Add d\n\n{stack_info(4)}"
+
+
+def test_branches_pushed_labels_amended_branch_updated_and_new_branch_new(
+    work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    run_export()
+    a1, b1, c1 = work.shas()
+    # Amend the top commit's content (message and stack-info unchanged) and
+    # put a brand new commit on top of it.
+    (work.path / "c.txt").write_text("c changed\n")
+    work.git("add", "c.txt")
+    work.git("commit", "-q", "--amend", "--no-edit")
+    c2 = work.head()
+    assert c2 != c1
+    assert work.message() == work.message(c1)
+    d = work.commit("d.txt", "Add d")
+
+    rc, out, err = run_export("-v")
+
+    assert rc == 0
+    assert err == ""
+    assert plan_lines(out) == [
+        f"push to origin: {d[:8]} -> testbot/stack/4 (new branch)",
+        f"create PR for {d[:8]}: testbot/stack/4 -> testbot/stack/3",
+        (
+            "rewrite 1 commit message to embed stack-info (git commit-tree; "
+            "file contents, authors and dates are unchanged)"
+        ),
+        (
+            f"move feature from {d[:8]} to the rewritten tip "
+            f"(git update-ref, only if it is still at {d[:8]})"
+        ),
+        (
+            "push the stack to origin (--atomic --force-with-lease): "
+            "testbot/stack/3, testbot/stack/4"
+        ),
+        "update PR #1: body (cross-links)",
+        "update PR #2: body (cross-links)",
+        "update PR #3: body (cross-links)",
+        f"update the new PR for {d[:8]}: body (cross-links)",
+    ]
+    assert result_block(out) == [
+        "Exported 4 pull requests (1 new, 3 updated):",
+        result_line(4, 4, "new", "Add d"),
+        result_line(3, 3, "updated", "Add c"),
+        result_line(2, 2, "updated", "Add b"),
+        result_line(1, 1, "updated", "Add a"),
+        "Branches pushed: testbot/stack/3 (updated), testbot/stack/4 (new)",
+    ]
+    branches = work.remote.branches()
+    assert branches["testbot/stack/1"] == a1
+    assert branches["testbot/stack/2"] == b1
+    assert branches["testbot/stack/3"] == c2
+    assert branches["testbot/stack/4"] == work.head()
+    assert work.git("show", f"{branches['testbot/stack/3']}:c.txt") == "c changed"
+
+
+def test_lease_and_labels_follow_the_remote_not_stale_tracking_refs(
+    tmp_path: Path,
+    work: Work,
+    fake_gh: FakeGitHub,
+    run_export: RunExport,
+    stack3: list[str],
+) -> None:
+    run_export()
+    a1, b1, c1 = work.shas()
+    # Pushing updated the remote-tracking ref of the stack branch...
+    assert work.head("refs/remotes/origin/testbot/stack/2") == b1
+
+    # ...but someone else moves that branch from another clone, so the
+    # tracking ref is stale by the time we export again.
+    other = other_clone(tmp_path, work)
+    git("checkout", "-q", "testbot/stack/2", cwd=other)
+    theirs = commit_in(other, "theirs.txt", "Their tweak")
+    git("push", "-q", "origin", "HEAD:testbot/stack/2", cwd=other)
+    assert work.remote.sha("testbot/stack/2") == theirs
+    assert work.head("refs/remotes/origin/testbot/stack/2") == b1
+    assert fake_gh.pr(2)["state"] == "OPEN"
+    start = len(fake_gh.calls())
+
+    rc, out, err = run_export("-v")
+
+    # The lease was taken on what ls-remote reported, not on the stale ref, so
+    # the push went through and the branch counts as updated, not new.
+    assert rc == 0, err
+    assert plan_lines(out) == [
+        "push the stack to origin (--atomic --force-with-lease): testbot/stack/2"
+    ]
+    assert result_block(out) == [
+        "Exported 3 pull requests (1 updated, 2 unchanged):",
+        result_line(3, 3, "unchanged", "Add c"),
+        result_line(2, 2, "updated", "Add b"),
+        result_line(1, 1, "unchanged", "Add a"),
+        "Branches pushed: testbot/stack/2 (updated)",
+    ]
+    assert work.remote.sha("testbot/stack/2") == b1
+    assert work.remote.sha("testbot/stack/1") == a1
+    assert work.remote.sha("testbot/stack/3") == c1
+    assert work.shas() == [a1, b1, c1]
+    assert not has_object(work, theirs)  # nothing but the target is ever fetched
+    # Only the batched PR lookup talked to GitHub: no writes, no login lookup.
+    new_calls = fake_gh.calls()[start:]
+    assert len(new_calls) == 1
+    assert new_calls[0][:4] == GRAPHQL_CALL
+
+
+# --------------------------------------------------------------------------- #
+# 17. partial and shallow clones
+# --------------------------------------------------------------------------- #
+def github_clone(remote: Remote, path: Path, *clone_flags: str) -> Work:
+    """Clone ``remote`` the way the ``work`` fixture does, with extra clone flags.
+
+    The source is a ``file://`` URL because git ignores ``--filter`` and
+    ``--depth`` when cloning from a plain local path.
+    """
+    url = f"file://{remote.path}"
+    git("clone", "-q", *clone_flags, url, str(path), cwd=path.parent)
+    github_url = f"git@github.com:{remote.slug}.git"
+    git("remote", "set-url", "origin", github_url, cwd=path)
+    git("config", f"url.{remote.path}.insteadOf", github_url, cwd=path)
+    git("checkout", "-q", "-b", "feature", cwd=path)
+    return Work(path=path, remote=remote)
+
+
+def test_export_from_partial_clone_fetches_main_once_and_nothing_else(
+    tmp_path: Path, remote: Remote, fake_gh: FakeGitHub
+) -> None:
+    git("config", "uploadpack.allowFilter", "true", cwd=remote.path)
+    partial = github_clone(remote, tmp_path / "partial", "--filter=blob:none")
+    assert partial.git("config", "--get", "remote.origin.promisor") == "true"
+    assert (
+        partial.git("config", "--get", "remote.origin.partialclonefilter")
+        == "blob:none"
+    )
+    main = partial.head("origin/main")
+    assert remote.sha("main") == main
+    a = partial.commit("a.txt", "Add a")
+    b = partial.commit("b.txt", "Add b")
+
+    proc = export_in_subprocess(partial, "-vv")
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"(base: origin/main @ {main[:8]})" in proc.stdout
+    assert result_block(proc.stdout) == [
+        "Exported 2 pull requests (2 new):",
+        result_line(2, 2, "new", "Add b"),
+        result_line(1, 1, "new", "Add a"),
+        "Branches pushed: testbot/stack/1 (new), testbot/stack/2 (new)",
+    ]
+    prs = fake_gh.prs()
+    assert [
+        (prs[n]["title"], prs[n]["headRefName"], prs[n]["baseRefName"]) for n in (1, 2)
+    ] == [
+        ("Add a", "testbot/stack/1", "main"),
+        ("Add b", "testbot/stack/2", "testbot/stack/1"),
+    ]
+    # A partial clone fetches like any other: exactly one targeted fetch of
+    # main, and the promisor remote's filter did not make the tool fetch more.
+    assert fetch_lines(proc) == [FETCH_MAIN]
+    assert partial.head("origin/main") == main
+    assert tracking_refs(partial) == [
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/testbot/stack/1",
+        "refs/remotes/origin/testbot/stack/2",
+    ]
+    assert partial.messages() == [
+        f"Add a\n\n{stack_info(1)}",
+        f"Add b\n\n{stack_info(2)}",
+    ]
+    assert partial.head() != b
+    assert [partial.tree(s) for s in partial.shas()] == [
+        partial.tree(a),
+        partial.tree(b),
+    ]
+    assert remote.sha("testbot/stack/2") == partial.head()
+    assert remote.sha("testbot/stack/1") == partial.head("HEAD~1")
+    assert partial.git("config", "--get", "remote.origin.promisor") == "true"
+
+
+def test_export_from_shallow_clone_works_when_the_merge_base_is_in_its_history(
+    tmp_path: Path, remote: Remote, fake_gh: FakeGitHub
+) -> None:
+    # main gets three commits; a depth-1 clone sees only the last of them.
+    advance = tmp_path / "advance"
+    git("clone", "-q", str(remote.path), str(advance), cwd=tmp_path)
+    commit_in(advance, "m2.txt", "Add m2")
+    commit_in(advance, "m3.txt", "Add m3")
+    git("push", "-q", "origin", "HEAD:main", cwd=advance)
+    main = remote.sha("main")
+    assert main is not None
+    assert git("rev-list", "--count", "main", cwd=remote.path) == "3"
+
+    shallow = github_clone(remote, tmp_path / "shallow", "--depth", "1")
+    assert shallow.git("rev-parse", "--is-shallow-repository") == "true"
+    assert shallow.git("rev-list", "--count", "HEAD") == "1"
+    assert shallow.head("origin/main") == main
+    a = shallow.commit("a.txt", "Add a")
+
+    proc = export_in_subprocess(shallow, "-vv")
+
+    # The merge base of the stack and origin/main is the shallow boundary
+    # commit itself, which the clone has, so the export goes through. (A
+    # stack based below the boundary would have no merge base at all; that
+    # case is not exercised here.)
+    assert proc.returncode == 0, proc.stderr
+    assert f"(base: origin/main @ {main[:8]})" in proc.stdout
+    assert result_block(proc.stdout) == [
+        "Exported 1 pull request (1 new):",
+        result_line(1, 1, "new", "Add a"),
+        "Branches pushed: testbot/stack/1 (new)",
+    ]
+    assert fetch_lines(proc) == [FETCH_MAIN]
+    pr = fake_gh.pr(1)
+    assert (pr["title"], pr["headRefName"], pr["baseRefName"]) == (
+        "Add a",
+        "testbot/stack/1",
+        "main",
+    )
+    assert shallow.message() == f"Add a\n\n{stack_info(1)}"
+    assert shallow.head() != a
+    assert shallow.tree() == shallow.tree(a)
+    assert shallow.head("HEAD~1") == main
+    assert remote.sha("testbot/stack/1") == shallow.head()
+    # The one fetch did not deepen the clone: it is still shallow and still
+    # holds just the boundary commit below the stack.
+    assert shallow.git("rev-parse", "--is-shallow-repository") == "true"
+    assert shallow.git("rev-list", "--count", "HEAD") == "2"
+    # --depth implies --single-branch: origin's fetch refspec covers only main,
+    # so git creates no tracking ref for the pushed stack branch either.
+    assert shallow.git("config", "--get", "remote.origin.fetch") == (
+        "+refs/heads/main:refs/remotes/origin/main"
+    )
+    assert tracking_refs(shallow) == [
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]

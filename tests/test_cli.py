@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -358,6 +359,11 @@ def test_main_config_from_env_var_supplies_defaults(
     err = capsys.readouterr().err
     assert rc == 1
     assert "target branch 'origin/nope' does not exist" in err
+    # A missing target stops the run before GitHub is contacted or anything is
+    # pushed, and the failed fetch leaves no tracking ref behind.
+    assert fake_gh.calls() == []
+    assert work.remote.branches() == {"main": work.head("origin/main")}
+    assert work.git("rev-parse", "--verify", "-q", "origin/nope", check=False) == ""
 
 
 def test_main_config_file_in_repo_root_supplies_defaults(
@@ -417,17 +423,88 @@ def test_export_nothing_to_export_when_no_commits_above_main(
     assert work.remote.branches() == {"main": work.head("origin/main")}
 
 
-def test_export_nothing_to_export_verbose_shows_fetch_first(
+def test_export_nothing_to_export_verbose_shows_contacting_first(
     work: Work, fake_gh: FakeGitHub, run_export: RunExport
 ) -> None:
     rc, out, err = run_export("-v")
     assert rc == 0
     assert (
         out
-        == "Fetching origin...\nNothing to export: no commits in origin/main..HEAD.\n"
+        == "Contacting origin...\nNothing to export: no commits in origin/main..HEAD.\n"
     )
     assert err == ""
     assert fake_gh.calls() == []
+
+
+def run_cli(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run ``pstack-pr`` in a fresh interpreter, so that -vv logging is set up.
+
+    Under pytest the root logger already has handlers, which would make the
+    CLI's ``logging.basicConfig`` a no-op in-process.
+    """
+    return subprocess.run(
+        [sys.executable, "-m", "pstack_pr", *args],
+        cwd=cwd,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_export_nothing_to_export_double_verbose_fetches_main_exactly_once(
+    work: Work, fake_gh: FakeGitHub
+) -> None:
+    main_sha = work.head("origin/main")
+
+    proc = run_cli(work.path, "export", "-vv")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == (
+        "Contacting origin...\nNothing to export: no commits in origin/main..HEAD.\n"
+    )
+    # Even with nothing to export, origin/main is refreshed with the one
+    # targeted fetch; the remote is not asked anything else and gh is not run.
+    fetches = [x for x in proc.stderr.splitlines() if x.startswith("$ git fetch")]
+    assert fetches == [
+        "$ git fetch --quiet --no-tags origin +refs/heads/main:refs/remotes/origin/main"
+    ]
+    assert "$ git ls-remote" not in proc.stderr
+    assert "$ git push" not in proc.stderr
+    assert "$ gh " not in proc.stderr
+    assert work.head("origin/main") == main_sha
+    assert fake_gh.calls() == []
+
+
+def test_export_missing_target_double_verbose_shows_the_failed_fetch_and_stops(
+    work: Work, fake_gh: FakeGitHub
+) -> None:
+    work.commit("a.txt", "Add a")
+
+    proc = run_cli(work.path, "export", "-vv", "--target", "nope")
+
+    assert proc.returncode == 1
+    assert proc.stdout == "Contacting origin...\n"
+    lines = proc.stderr.splitlines()
+    fetch = (
+        "$ git fetch --quiet --no-tags origin +refs/heads/nope:refs/remotes/origin/nope"
+    )
+    assert lines.count(fetch) == 1
+    assert "  [stderr] fatal: couldn't find remote ref refs/heads/nope" in lines
+    assert lines[-1] == "error: target branch 'origin/nope' does not exist"
+    assert lines.index(fetch) < lines.index(lines[-1])
+    # Only 'main' gets the 'master' hint lookup, so here the failed fetch is
+    # the only remote operation: no ls-remote for the stack branches, no gh
+    # call, nothing pushed and no tracking ref for the missing branch.
+    assert sum(1 for x in lines if x.startswith("$ git fetch")) == 1
+    assert "$ git ls-remote" not in proc.stderr
+    assert "$ git push" not in proc.stderr
+    assert "$ gh " not in proc.stderr
+    assert "seems to use 'master'" not in proc.stderr
+    assert fake_gh.calls() == []
+    assert work.remote.branches() == {"main": work.head("origin/main")}
+    assert work.git("rev-parse", "--verify", "-q", "origin/nope", check=False) == ""
+    assert work.message() == "Add a"
 
 
 def test_export_nothing_to_export_via_run_export_fixture(
@@ -546,8 +623,8 @@ def test_export_prints_result_with_pr_urls(
     rc, out, err = run_export()
     assert rc == 0
     assert err == ""
-    # Without -v the result block is the *entire* output: no fetch notice, no
-    # stack table, no plan, no progress lines.
+    # Without -v the result block is the *entire* output: no 'Contacting'
+    # notice, no stack table, no plan, no progress lines.
     assert out == STACK3_EXPORTED
 
 
@@ -564,7 +641,7 @@ def test_export_rerun_reports_up_to_date_and_nothing_pushed(
     assert fake_gh.state()["prs"] == remote_before["prs"]
 
 
-def test_export_verbose_prints_fetch_stack_plan_progress_then_result(
+def test_export_verbose_prints_contacting_stack_plan_progress_then_result(
     work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
 ) -> None:
     rc, out, err = run_export("-v")
@@ -572,7 +649,7 @@ def test_export_verbose_prints_fetch_stack_plan_progress_then_result(
     assert err == ""
     base = work.head("origin/main")[:8]
     landmarks = [
-        "Fetching origin...\n",
+        "Contacting origin...\n",
         f"Stack of 3 commits on feature (base: origin/main @ {base})\n",
         "   3  ",  # the stack table lists the newest commit first
         "  new PR  testbot/stack/3  Add c\n",
@@ -599,7 +676,7 @@ def test_export_verbose_rerun_says_nothing_to_do_and_up_to_date(
     rc, out, err = run_export("-v")
     assert rc == 0
     assert err == ""
-    assert out.startswith("Fetching origin...\nStack of 3 commits on feature ")
+    assert out.startswith("Contacting origin...\nStack of 3 commits on feature ")
     assert "\nEverything is up to date; nothing to do.\n" in out
     assert "Plan:" not in out
     assert "[1/" not in out
@@ -613,7 +690,7 @@ def test_export_config_verbose_true_behaves_like_dash_v(
     rc, out, err = run_export()
     assert rc == 0
     assert err == ""
-    assert out.startswith("Fetching origin...\nStack of 3 commits on feature ")
+    assert out.startswith("Contacting origin...\nStack of 3 commits on feature ")
     assert "\nPlan:\n" in out
     assert "  [1/10] push to origin: " in out
     assert out.endswith("\n\n" + STACK3_EXPORTED)

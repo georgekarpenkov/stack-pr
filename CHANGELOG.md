@@ -1,5 +1,17 @@
 # Top of tree
 
+# Version 0.2.2
+
+* No more `git fetch` of the whole remote. Planning fetches the target branch
+  alone (an explicit refspec, one round trip) and looks up the stack branches
+  with a single `git ls-remote --heads`. Remote branches of other people are
+  never downloaded.
+* All existing pull requests of a stack are looked up in one GraphQL request
+  instead of one `gh pr view` per PR, and the GitHub login is only queried
+  when a new branch name has to be allocated. Re-exporting an unchanged
+  stack therefore costs two `ls-remote` calls and one API request.
+* The `-v` progress line reads `Contacting origin...`.
+
 # Version 0.2.1
 
 * `export` is quiet by default: it prints only the result, one line per pull

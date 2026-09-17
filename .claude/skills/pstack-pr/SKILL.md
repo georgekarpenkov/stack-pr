@@ -14,7 +14,7 @@ the index; the only local write is one atomic move of the current branch.
 Use whichever form is available:
 
 - `pstack-pr export ...` (installed with `uv tool install`)
-- `uvx --from git+https://github.com/georgekarpenkov/stack-pr@v0.2.1 pstack-pr export ...`
+- `uvx --from git+https://github.com/georgekarpenkov/stack-pr@v0.2.2 pstack-pr export ...`
 
 ## Check prerequisites
 

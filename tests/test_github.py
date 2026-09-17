@@ -7,12 +7,18 @@ The pure helpers (URL parsing, JSON decoding) are tested directly. The
 
 from __future__ import annotations
 
+import json
+import re
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
 
+from pstack_pr import github as github_module
 from pstack_pr.errors import PstackError
 from pstack_pr.github import (
+    GRAPHQL_BATCH_SIZE,
+    PR_GRAPHQL_FIELDS,
     PR_JSON_FIELDS,
     GitHub,
     PullRequest,
@@ -665,6 +671,488 @@ def test_view_pr_unknown_number_raises_command_error_with_gh_stderr(
     assert "Could not resolve to a PullRequest with the number of 999" in str(err)
     assert "command failed with exit code 1:" in str(err)
     assert "gh pr view 999 --repo github.com/octo/widgets --json" in str(err)
+
+
+# --------------------------------------------------------------------------- #
+# GitHub.view_prs: the batched lookup through 'gh api graphql'
+# --------------------------------------------------------------------------- #
+GRAPHQL_PREFIX = ["api", "--hostname", "github.com", "graphql"]
+REJECTED = "GitHub rejected the pull request lookup in https://github.com/octo/widgets:"
+
+
+def seed_prs(fake_gh: FakeGitHub, numbers: Iterable[int]) -> dict[int, PullRequest]:
+    """Write open pull requests straight into the fake gh state.
+
+    One ``gh pr create`` is a subprocess; for dozens of PRs that is slow and
+    needs as many branches. Only the lookup is exercised here, so the PRs are
+    planted directly. Returns what :meth:`GitHub.view_prs` must hand back.
+    """
+    data = fake_gh.state()
+    expected: dict[int, PullRequest] = {}
+    for n in numbers:
+        pr = PullRequest(
+            number=n,
+            url=f"https://github.com/octo/widgets/pull/{n}",
+            state="OPEN" if n % 3 else "MERGED",
+            is_draft=n % 2 == 0,
+            title=f"Change {n}",
+            body=f"Body {n}\nwith a second line\n",
+            base="main" if n == 1 else f"testbot/stack/{n - 1}",
+            head=f"testbot/stack/{n}",
+        )
+        data["prs"][str(n)] = {
+            "number": pr.number,
+            "url": pr.url,
+            "state": pr.state,
+            "isDraft": pr.is_draft,
+            "title": pr.title,
+            "body": pr.body,
+            "baseRefName": pr.base,
+            "headRefName": pr.head,
+            "reviewers": [],
+        }
+        expected[n] = pr
+        data["next_number"] = max(data["next_number"], n + 1)
+    fake_gh.state_path.write_text(json.dumps(data))
+    return expected
+
+
+def graphql_calls(fake_gh: FakeGitHub) -> list[list[str]]:
+    return fake_gh.calls(*GRAPHQL_PREFIX)
+
+
+def requested_numbers(call: list[str]) -> list[int]:
+    """The PR numbers one 'gh api graphql' call asks for, in query order."""
+    assert call[:4] == GRAPHQL_PREFIX
+    assert call[4] == "-f"
+    assert call[5].startswith("query=")
+    assert call[6:] == ["-f", "owner=octo", "-f", "name=widgets"]
+    query = call[5][len("query=") :]
+    pairs = re.findall(r"pr(\d+): pullRequest\(number: (\d+)\)", query)
+    assert pairs, query
+    assert all(alias == number for alias, number in pairs)
+    return [int(number) for _, number in pairs]
+
+
+@pytest.fixture
+def three_prs(gh: GitHub, work: Work, branches: dict[str, str]) -> list[PullRequest]:
+    """Three chained PRs created through the fake ``gh pr create``."""
+    c = work.commit("c.txt", "Add c")
+    work.git("push", "-q", "origin", f"{c}:refs/heads/testbot/stack/3")
+    return [
+        create_first(gh, draft=True, reviewers=("alice",)),
+        gh.create_pr(
+            base="testbot/stack/1",
+            head="testbot/stack/2",
+            title="Add b",
+            body="Second body with 'quotes', $dollars and\n\nblank lines\n",
+            draft=False,
+        ),
+        gh.create_pr(
+            base="testbot/stack/2",
+            head="testbot/stack/3",
+            title="Add c",
+            body="",
+            draft=False,
+        ),
+    ]
+
+
+def test_view_prs_empty_returns_empty_dict_without_calling_gh(
+    gh: GitHub, fake_gh: FakeGitHub
+) -> None:
+    assert gh.view_prs([]) == {}
+    assert fake_gh.calls() == []
+
+
+def test_view_prs_three_numbers_make_exactly_one_graphql_call(
+    gh: GitHub, fake_gh: FakeGitHub, three_prs: list[PullRequest]
+) -> None:
+    before = len(fake_gh.calls())
+    prs = gh.view_prs([1, 2, 3])
+    new_calls = fake_gh.calls()[before:]
+    assert len(new_calls) == 1
+    [call] = new_calls
+    assert call[:4] == GRAPHQL_PREFIX
+    assert call[6:] == ["-f", "owner=octo", "-f", "name=widgets"]
+    query = call[5]
+    assert query.startswith("query=query($owner: String!, $name: String!) {")
+    assert "repository(owner: $owner, name: $name)" in query
+    for n in (1, 2, 3):
+        assert f"pr{n}: pullRequest(number: {n}) {{ {PR_GRAPHQL_FIELDS} }}" in query
+    assert requested_numbers(call) == [1, 2, 3]
+    # The repository is passed as GraphQL variables, never inlined.
+    assert "octo" not in query
+    assert "widgets" not in query
+    assert set(prs) == {1, 2, 3}
+
+
+def test_view_prs_never_uses_gh_pr_view(
+    gh: GitHub, fake_gh: FakeGitHub, three_prs: list[PullRequest]
+) -> None:
+    gh.view_prs([1, 2, 3])
+    assert fake_gh.calls("pr", "view") == []
+    assert fake_gh.calls("api", "--hostname", "github.com", "user") == []
+    assert len(graphql_calls(fake_gh)) == 1
+
+
+def test_view_prs_returns_pull_requests_keyed_by_number(
+    gh: GitHub, three_prs: list[PullRequest]
+) -> None:
+    prs = gh.view_prs([1, 2, 3])
+    assert set(prs) == {1, 2, 3}
+    for n, pr in prs.items():
+        assert isinstance(pr, PullRequest)
+        assert pr.number == n
+        assert pr.url == f"https://github.com/octo/widgets/pull/{n}"
+    assert prs[1] == three_prs[0]
+    assert prs[2] == three_prs[1]
+    assert prs[3] == three_prs[2]
+
+
+def test_view_prs_matches_view_pr_field_for_field(
+    gh: GitHub, three_prs: list[PullRequest]
+) -> None:
+    prs = gh.view_prs([3, 1, 2])
+    for n in (1, 2, 3):
+        assert prs[n] == gh.view_pr(n)
+    assert prs[1].is_draft is True
+    assert prs[1].title == "Add a"
+    assert prs[1].body == "First body\n"
+    assert prs[1].base == "main"
+    assert prs[1].head == "testbot/stack/1"
+    assert prs[2].is_draft is False
+    assert prs[2].body == "Second body with 'quotes', $dollars and\n\nblank lines\n"
+    assert prs[2].base == "testbot/stack/1"
+    assert prs[3].body == ""
+    assert prs[3].base == "testbot/stack/2"
+    assert prs[3].head == "testbot/stack/3"
+    assert all(pr.state == "OPEN" for pr in prs.values())
+
+
+def test_view_prs_accepts_any_order_and_a_subset(
+    gh: GitHub, fake_gh: FakeGitHub, three_prs: list[PullRequest]
+) -> None:
+    prs = gh.view_prs([3, 1])
+    assert set(prs) == {1, 3}
+    assert prs[1] == three_prs[0]
+    assert prs[3] == three_prs[2]
+    [call] = graphql_calls(fake_gh)
+    assert requested_numbers(call) == [3, 1]
+
+
+def test_view_prs_single_number_matches_view_pr(
+    gh: GitHub, three_prs: list[PullRequest]
+) -> None:
+    assert gh.view_prs([2]) == {2: gh.view_pr(2)}
+
+
+def test_view_prs_returns_fresh_objects_on_every_call(
+    gh: GitHub, three_prs: list[PullRequest]
+) -> None:
+    first = gh.view_prs([1, 2])
+    second = gh.view_prs([1, 2])
+    assert first == second
+    assert first[1] is not second[1]
+    assert first[1] is not first[2]
+    first[1].body = "mutated locally"
+    assert second[1].body == "First body\n"
+    assert gh.view_prs([1])[1].body == "First body\n"
+
+
+def test_view_prs_reflects_state_changes(
+    gh: GitHub, fake_gh: FakeGitHub, three_prs: list[PullRequest]
+) -> None:
+    fake_gh.close(1)
+    fake_gh.set_body(2, "edited elsewhere")
+    prs = gh.view_prs([1, 2, 3])
+    assert prs[1].state == "CLOSED"
+    assert prs[2].body == "edited elsewhere"
+    assert prs[3] == three_prs[2]
+
+
+def test_view_prs_sees_prs_planted_in_the_fake_state(
+    gh: GitHub, fake_gh: FakeGitHub
+) -> None:
+    # Sanity check for the seeding helper the batching tests rely on.
+    expected = seed_prs(fake_gh, [1, 2, 3])
+    assert gh.view_prs([1, 2, 3]) == expected
+    assert gh.view_pr(2) == expected[2]
+    assert expected[2].is_draft is True
+    assert expected[3].state == "MERGED"
+
+
+def test_view_prs_batch_size_is_fifty() -> None:
+    assert GRAPHQL_BATCH_SIZE == 50
+
+
+def test_view_prs_sixty_numbers_use_two_batches_of_fifty(
+    gh: GitHub, fake_gh: FakeGitHub
+) -> None:
+    expected = seed_prs(fake_gh, range(1, 61))
+    prs = gh.view_prs(list(range(1, 61)))
+    calls = graphql_calls(fake_gh)
+    assert len(calls) == 2
+    assert fake_gh.calls() == calls
+    assert requested_numbers(calls[0]) == list(range(1, 51))
+    assert requested_numbers(calls[1]) == list(range(51, 61))
+    assert prs == expected
+    assert list(prs) == list(range(1, 61))
+    assert prs[50] == gh.view_pr(50)
+    assert prs[51] == gh.view_pr(51)
+    assert prs[60] == gh.view_pr(60)
+
+
+def test_view_prs_fifty_numbers_fit_in_one_batch(
+    gh: GitHub, fake_gh: FakeGitHub
+) -> None:
+    expected = seed_prs(fake_gh, range(1, 51))
+    assert gh.view_prs(list(range(1, 51))) == expected
+    calls = graphql_calls(fake_gh)
+    assert len(calls) == 1
+    assert requested_numbers(calls[0]) == list(range(1, 51))
+
+
+def test_view_prs_fifty_one_numbers_need_a_second_batch(
+    gh: GitHub, fake_gh: FakeGitHub
+) -> None:
+    expected = seed_prs(fake_gh, range(1, 52))
+    assert gh.view_prs(list(range(1, 52))) == expected
+    calls = graphql_calls(fake_gh)
+    assert [requested_numbers(c) for c in calls] == [list(range(1, 51)), [51]]
+
+
+def test_view_prs_batches_follow_the_configured_size(
+    gh: GitHub, fake_gh: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(github_module, "GRAPHQL_BATCH_SIZE", 2)
+    expected = seed_prs(fake_gh, [1, 2, 3, 4, 5])
+    prs = gh.view_prs([1, 2, 3, 4, 5])
+    calls = graphql_calls(fake_gh)
+    assert [requested_numbers(c) for c in calls] == [[1, 2], [3, 4], [5]]
+    assert prs == expected
+    assert set(prs) == {1, 2, 3, 4, 5}
+
+
+def test_view_prs_batches_keep_the_callers_order(
+    gh: GitHub, fake_gh: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(github_module, "GRAPHQL_BATCH_SIZE", 2)
+    expected = seed_prs(fake_gh, [7, 9, 12])
+    prs = gh.view_prs([12, 7, 9])
+    assert [requested_numbers(c) for c in graphql_calls(fake_gh)] == [[12, 7], [9]]
+    assert prs == expected
+
+
+def test_view_prs_missing_number_raises_pstack_error_with_gh_message(
+    gh: GitHub, fake_gh: FakeGitHub
+) -> None:
+    with pytest.raises(PstackError) as excinfo:
+        gh.view_prs([999])
+    err = excinfo.value
+    assert not isinstance(err, CommandError)
+    assert isinstance(err.__cause__, CommandError)
+    assert err.__cause__.returncode == 1
+    message = str(err)
+    assert message.startswith(REJECTED)
+    assert "Could not resolve to a PullRequest with the number of 999" in message
+    assert message.splitlines() == [
+        REJECTED,
+        "  Could not resolve to a PullRequest with the number of 999.",
+    ]
+    assert len(graphql_calls(fake_gh)) == 1
+
+
+def test_view_prs_missing_number_next_to_existing_ones_raises(
+    gh: GitHub, fake_gh: FakeGitHub, three_prs: list[PullRequest]
+) -> None:
+    with pytest.raises(PstackError) as excinfo:
+        gh.view_prs([1, 404, 2])
+    message = str(excinfo.value)
+    assert "Could not resolve to a PullRequest with the number of 404" in message
+    assert "number of 1" not in message
+    assert "number of 2" not in message
+    [call] = graphql_calls(fake_gh)
+    assert requested_numbers(call) == [1, 404, 2]
+
+
+def test_view_prs_lists_every_missing_number(
+    gh: GitHub, fake_gh: FakeGitHub, three_prs: list[PullRequest]
+) -> None:
+    with pytest.raises(PstackError) as excinfo:
+        gh.view_prs([1, 500, 600])
+    lines = str(excinfo.value).splitlines()
+    assert lines[0] == REJECTED
+    assert lines[1:] == [
+        "  Could not resolve to a PullRequest with the number of 500.",
+        "  Could not resolve to a PullRequest with the number of 600.",
+    ]
+
+
+def test_view_prs_missing_number_in_a_later_batch_still_raises(
+    gh: GitHub, fake_gh: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(github_module, "GRAPHQL_BATCH_SIZE", 2)
+    seed_prs(fake_gh, [1, 2, 3])
+    with pytest.raises(PstackError, match="number of 999"):
+        gh.view_prs([1, 2, 3, 999])
+    # The first batch succeeded; the failing one was the second.
+    assert [requested_numbers(c) for c in graphql_calls(fake_gh)] == [[1, 2], [3, 999]]
+
+
+def test_view_prs_null_node_without_errors_raises_does_not_exist(
+    gh: GitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # GitHub returns null for a node it cannot resolve; a payload without an
+    # "errors" list still must not be mistaken for a found pull request.
+    payload = {"data": {"repository": {"pr7": None}}}
+    monkeypatch.setattr(GitHub, "_gh", lambda *_a, **_k: json.dumps(payload))
+    with pytest.raises(PstackError) as excinfo:
+        gh.view_prs([7])
+    assert str(excinfo.value) == (
+        "pull request #7 does not exist in https://github.com/octo/widgets"
+    )
+
+
+def test_view_prs_node_missing_from_payload_raises_does_not_exist(
+    gh: GitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {"data": {"repository": {"pr1": FULL_JSON}}}
+    monkeypatch.setattr(GitHub, "_gh", lambda *_a, **_k: json.dumps(payload))
+    with pytest.raises(PstackError, match=r"pull request #2 does not exist"):
+        gh.view_prs([1, 2])
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "",
+        "{}",
+        json.dumps({"data": None}),
+        json.dumps({"data": {}}),
+        json.dumps({"data": {"repository": None}}),
+    ],
+)
+def test_view_prs_missing_repository_raises(
+    gh: GitHub, monkeypatch: pytest.MonkeyPatch, output: str
+) -> None:
+    monkeypatch.setattr(GitHub, "_gh", lambda *_a, **_k: output)
+    with pytest.raises(PstackError) as excinfo:
+        gh.view_prs([1])
+    assert str(excinfo.value) == (
+        "repository github.com/octo/widgets was not found on GitHub"
+    )
+
+
+def test_view_prs_node_with_missing_field_raises_from_json_error(
+    gh: GitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    node = {k: v for k, v in FULL_JSON.items() if k != "headRefName"}
+    payload = {"data": {"repository": {"pr30": node}}}
+    monkeypatch.setattr(GitHub, "_gh", lambda *_a, **_k: json.dumps(payload))
+    with pytest.raises(PstackError, match="unexpected response from gh") as excinfo:
+        gh.view_prs([30])
+    assert "headRefName" in str(excinfo.value)
+
+
+def test_view_prs_graphql_errors_are_joined_into_one_message(
+    gh: GitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout = json.dumps(
+        {
+            "data": {"repository": {"pr1": None, "pr2": None}},
+            "errors": [
+                {"type": "NOT_FOUND", "message": "first problem"},
+                {"type": "NOT_FOUND", "message": "second problem"},
+                {"type": "NOT_FOUND"},
+                "not a dict",
+                {"message": ""},
+            ],
+        }
+    )
+
+    def fail(_self: GitHub, *args: str, **_kw: object) -> str:
+        raise CommandError(["gh", *args], 1, stdout, "gh: first problem")
+
+    monkeypatch.setattr(GitHub, "_gh", fail)
+    with pytest.raises(PstackError) as excinfo:
+        gh.view_prs([1, 2])
+    assert str(excinfo.value) == f"{REJECTED}\n  first problem\n  second problem"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "",
+        "not json at all",
+        "{}",
+        json.dumps({"errors": []}),
+        json.dumps({"errors": None}),
+    ],
+)
+def test_view_prs_gh_failure_without_graphql_errors_keeps_command_error_text(
+    gh: GitHub, monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    def fail(_self: GitHub, *args: str, **_kw: object) -> str:
+        raise CommandError(["gh", *args], 4, stdout, "HTTP 502: bad gateway")
+
+    monkeypatch.setattr(GitHub, "_gh", fail)
+    with pytest.raises(PstackError) as excinfo:
+        gh.view_prs([1])
+    err = excinfo.value
+    assert not isinstance(err, CommandError)
+    assert isinstance(err.__cause__, CommandError)
+    message = str(err)
+    assert message == str(err.__cause__)
+    assert message.startswith("command failed with exit code 4:")
+    assert "HTTP 502: bad gateway" in message
+    assert "gh api --hostname github.com graphql" in message
+    assert REJECTED not in message
+
+
+def test_view_prs_passes_host_owner_and_name_of_the_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: list[tuple[str, ...]] = []
+    node = {**FULL_JSON, "url": "https://ghe.example.com/team/proj/pull/30"}
+
+    def fake(_self: GitHub, *args: str, **_kw: object) -> str:
+        recorded.append(args)
+        return json.dumps({"data": {"repository": {"pr30": node}}})
+
+    monkeypatch.setattr(GitHub, "_gh", fake)
+    ghe = GitHub(Repo(host="ghe.example.com", owner="team", name="proj"))
+    prs = ghe.view_prs([30])
+    assert prs[30].url == "https://ghe.example.com/team/proj/pull/30"
+    [args] = recorded
+    assert args[:4] == ("api", "--hostname", "ghe.example.com", "graphql")
+    assert args[4] == "-f"
+    assert args[5].startswith("query=")
+    assert args[6:] == ("-f", "owner=team", "-f", "name=proj")
+    assert "pr30: pullRequest(number: 30)" in args[5]
+    assert "team" not in args[5]
+    assert "proj" not in args[5]
+
+
+def test_view_prs_error_for_other_host_names_that_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"data": {"repository": {"pr3": None}}}
+    monkeypatch.setattr(GitHub, "_gh", lambda *_a, **_k: json.dumps(payload))
+    ghe = GitHub(Repo(host="ghe.example.com", owner="team", name="proj"))
+    with pytest.raises(PstackError) as excinfo:
+        ghe.view_prs([3])
+    assert str(excinfo.value) == (
+        "pull request #3 does not exist in https://ghe.example.com/team/proj"
+    )
+
+
+def test_view_prs_batch_helper_is_what_view_prs_uses(
+    gh: GitHub, fake_gh: FakeGitHub, three_prs: list[PullRequest]
+) -> None:
+    direct = gh._view_prs_batch([1, 2, 3])
+    assert direct == gh.view_prs([1, 2, 3])
+    assert len(graphql_calls(fake_gh)) == 2
 
 
 def test_find_open_pr_unknown_branch_returns_none(

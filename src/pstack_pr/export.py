@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from pstack_pr.errors import PstackError
 from pstack_pr.git import Commit, Git, PushRef, RefUpdate
@@ -520,27 +520,30 @@ class Plan:
 GitHubFactory = Callable[[Repo], GitHub]
 
 
-def _resolve_target(git: Git, opts: ExportOptions) -> str:
-    target_ref = f"refs/remotes/{opts.remote}/{opts.target}"
-    target_sha = git.try_rev_parse(target_ref)
-    if target_sha is not None:
-        return target_sha
-    hint = ""
-    if opts.target == "main" and git.try_rev_parse(
-        f"refs/remotes/{opts.remote}/master"
-    ):
-        hint = (
-            "\nThis repository seems to use 'master'; pass '--target master' "
-            "or set 'target = master' in the [repo] section of .pstack-pr.cfg."
+def _locate_target(git: Git, opts: ExportOptions) -> str:
+    """Bring ``remote/target`` up to date locally and return its sha.
+
+    Only that one branch is fetched: the explicit refspec makes the server
+    advertise and send just that ref, so the cost does not depend on how many
+    other branches the remote has. Nothing else is ever fetched.
+    """
+    if not git.fetch_branch(opts.remote, opts.target):
+        hint = ""
+        if opts.target == "main" and git.ls_remote(opts.remote, ["refs/heads/master"]):
+            hint = (
+                "\nThis repository seems to use 'master'; pass '--target master' "
+                "or set 'target = master' in the [repo] section of .pstack-pr.cfg."
+            )
+        raise PstackError(
+            f"target branch '{opts.remote}/{opts.target}' does not exist{hint}"
         )
-    raise PstackError(
-        f"target branch '{opts.remote}/{opts.target}' does not exist{hint}"
-    )
+    return git.rev_parse(f"refs/remotes/{opts.remote}/{opts.target}")
 
 
-def _read_stack(git: Git, opts: ExportOptions) -> tuple[str, str, Stack]:
+def _read_stack(
+    git: Git, opts: ExportOptions, target_sha: str
+) -> tuple[str, str, Stack]:
     """Return (base sha, head sha, stack) for the requested range."""
-    target_sha = _resolve_target(git, opts)
     head_sha = git.rev_parse(opts.head)
     base_sha = (
         git.rev_parse(opts.base) if opts.base else git.merge_base(head_sha, target_sha)
@@ -565,33 +568,50 @@ def _read_stack(git: Git, opts: ExportOptions) -> tuple[str, str, Stack]:
     return base_sha, head_sha, Stack(entries)
 
 
-def _assign_branches(ctx: Context, template: BranchTemplate) -> None:
-    """Give every entry a head branch and record where it points on the remote."""
+def _assign_branches(ctx: Context, template: BranchTemplate | None) -> None:
+    """Give every entry a head branch and record where it points on the remote.
+
+    ``template`` is only needed (and only given) when some entry has no
+    ``stack-info`` yet; then the remote is also asked for all branches matching
+    the template so that new names can be allocated and branches pushed by an
+    interrupted run can be adopted.
+    """
     git, opts, stack = ctx.git, ctx.opts, ctx.stack
-    prefix = f"refs/remotes/{opts.remote}/"
-    remote_branches = {
-        name.removeprefix(prefix): sha
-        for name, sha in git.for_each_ref(prefix + template.glob).items()
-    }
+    prefix = "refs/heads/"
 
     for e in stack.entries:
         if e.info is not None:
             e.branch = e.info.branch
 
-    # A previous run may have pushed a commit and been interrupted before the
-    # local branch was updated. Adopt such branches instead of allocating new
-    # ones, so no duplicate pull requests get created.
-    by_sha = {sha: name for name, sha in remote_branches.items()}
-    for e in stack.entries:
-        if e.info is None and e.commit.sha in by_sha:
-            e.branch = by_sha[e.commit.sha]
-            e.adopted = True
+    # One ls-remote for exactly the refs of interest: no objects are fetched.
+    patterns = [prefix + e.branch for e in stack.entries if e.branch]
+    if template is not None:
+        patterns.append(prefix + template.glob)
+    remote_branches = {
+        name.removeprefix(prefix): sha
+        for name, sha in git.ls_remote(opts.remote, patterns).items()
+        if name.startswith(prefix)
+    }
 
-    taken = set(remote_branches) | {e.branch for e in stack.entries if e.branch}
-    fresh = template.allocate(taken, sum(1 for e in stack.entries if not e.branch))
-    for e in stack.entries:
-        if not e.branch:
-            e.branch = fresh.pop(0)
+    if template is not None:
+        # A previous run may have pushed a commit and been interrupted before
+        # the local branch was updated. Adopt such branches instead of
+        # allocating new ones, so no duplicate pull requests get created.
+        by_sha = {
+            sha: name
+            for name, sha in remote_branches.items()
+            if template.parse_id(name) is not None
+        }
+        for e in stack.entries:
+            if e.info is None and e.commit.sha in by_sha:
+                e.branch = by_sha[e.commit.sha]
+                e.adopted = True
+
+        taken = set(remote_branches) | {e.branch for e in stack.entries if e.branch}
+        fresh = template.allocate(taken, sum(1 for e in stack.entries if not e.branch))
+        for e in stack.entries:
+            if not e.branch:
+                e.branch = fresh.pop(0)
 
     seen: dict[str, StackEntry] = {}
     for e in stack.entries:
@@ -604,11 +624,7 @@ def _assign_branches(ctx: Context, template: BranchTemplate) -> None:
         seen[e.branch] = e
 
     for e in stack.entries:
-        if e.branch in remote_branches:
-            e.remote_sha = remote_branches[e.branch]
-        else:
-            e.remote_sha = git.for_each_ref(prefix + e.branch).get(prefix + e.branch)
-    for e in stack.entries:
+        e.remote_sha = remote_branches.get(e.branch)
         e.branch_existed = e.remote_sha is not None
 
 
@@ -637,9 +653,12 @@ def _pr_number(entry: StackEntry, repo: Repo) -> int:
 def _load_pull_requests(ctx: Context) -> None:
     """Fetch existing PRs, set base branches, decide which commits change."""
     gh, opts, stack = ctx.gh, ctx.opts, ctx.stack
+    numbers = {e.index: _pr_number(e, gh.repo) for e in stack.entries if e.info}
+    # All known pull requests in one request, however deep the stack is.
+    prs = gh.view_prs(sorted(set(numbers.values())))
     for e in stack.entries:
-        if e.info is not None:
-            e.pr = gh.view_pr(_pr_number(e, gh.repo))
+        if e.index in numbers:
+            e.pr = replace(prs[numbers[e.index]])
             verify_existing_pr(e)
             if has_tmp_draft_marker(e.pr.body):
                 # A previous run was interrupted while the PR was a draft.
@@ -719,20 +738,25 @@ def plan_export(
     gh = github_factory(repo)
 
     if show_progress:
-        ui.info(ui.dim(f"Fetching {opts.remote}..."))
-    git.fetch(opts.remote)
+        ui.info(ui.dim(f"Contacting {opts.remote}..."))
+    target_sha = _locate_target(git, opts)
 
-    base_sha, head_sha, stack = _read_stack(git, opts)
+    base_sha, head_sha, stack = _read_stack(git, opts, target_sha)
     ctx = Context(git=git, gh=gh, opts=opts, stack=stack, ui=ui)
     plan = Plan(ctx=ctx, repo=repo, base_sha=base_sha, head_sha=head_sha, steps=[])
     if not stack.entries:
         return plan
 
     current_ref = git.current_branch_ref()
-    current_branch = current_ref.removeprefix("refs/heads/") if current_ref else "HEAD"
-    template = BranchTemplate(
-        opts.branch_template, username=gh.username(), current_branch=current_branch
-    )
+    template = None
+    if any(e.info is None for e in stack.entries):
+        # Branch names must be allocated, which needs the GitHub login.
+        current_branch = (
+            current_ref.removeprefix("refs/heads/") if current_ref else "HEAD"
+        )
+        template = BranchTemplate(
+            opts.branch_template, username=gh.username(), current_branch=current_branch
+        )
     _assign_branches(ctx, template)
     _load_pull_requests(ctx)
     _find_ref_rewrites(ctx, head_sha, current_ref)
