@@ -20,6 +20,7 @@ from pstack_pr.github import (
     GRAPHQL_BATCH_SIZE,
     PR_GRAPHQL_FIELDS,
     PR_JSON_FIELDS,
+    Comment,
     GitHub,
     PullRequest,
     Repo,
@@ -326,6 +327,60 @@ def test_pull_request_from_json_body_null_becomes_empty_string() -> None:
 def test_pull_request_from_json_body_missing_becomes_empty_string() -> None:
     data = {k: v for k, v in FULL_JSON.items() if k != "body"}
     assert PullRequest.from_json(data).body == ""
+
+
+def test_pull_request_from_json_without_comments_has_none() -> None:
+    assert PullRequest.from_json(FULL_JSON).comments == []
+    assert PullRequest.from_json({**FULL_JSON, "comments": None}).comments == []
+
+
+def test_pull_request_from_json_comments_in_gh_list_shape_take_id_from_url() -> None:
+    # ``gh pr view --json comments``: ``id`` is the node id, the REST id is
+    # only in the url fragment.
+    data = {
+        **FULL_JSON,
+        "comments": [
+            {
+                "id": "IC_kwDOAbc",
+                "url": "https://github.com/octo/widgets/pull/30#issuecomment-4242",
+                "body": "First",
+                "author": {"login": "testbot"},
+            },
+            {"id": "IC_kwDOAbd", "url": "https://example.com/no-fragment", "body": "x"},
+        ],
+    }
+    assert PullRequest.from_json(data).comments == [Comment(id=4242, body="First")]
+
+
+def test_pull_request_from_json_comments_in_graphql_shape_use_database_id() -> None:
+    data = {
+        **FULL_JSON,
+        "comments": {
+            "nodes": [
+                {"databaseId": 7, "url": "u#issuecomment-7", "body": "A"},
+                {"databaseId": 8, "url": "u#issuecomment-8", "body": None},
+            ]
+        },
+    }
+    assert PullRequest.from_json(data).comments == [
+        Comment(id=7, body="A"),
+        Comment(id=8, body=""),
+    ]
+
+
+def test_comment_from_json_rest_shape_uses_numeric_id() -> None:
+    data = {"id": 99, "html_url": "https://x/pull/1#issuecomment-99", "body": "B"}
+    assert Comment.from_json(data) == Comment(id=99, body="B")
+
+
+def test_comment_from_json_without_any_id_is_none() -> None:
+    assert Comment.from_json({"body": "B"}) is None
+    assert Comment.from_json({"id": "IC_node", "body": "B"}) is None
+
+
+def test_json_fields_include_comments() -> None:
+    assert PR_JSON_FIELDS.split(",")[-1] == "comments"
+    assert "comments(first: 100) { nodes { databaseId url body } }" in PR_GRAPHQL_FIELDS
 
 
 def test_pull_request_from_json_number_as_string_is_converted() -> None:
@@ -1398,6 +1453,115 @@ def test_fake_gh_rejects_other_hosts_in_repo_flag(
         ghe.find_open_pr("testbot/stack/1")
     [call] = fake_gh.calls("pr", "list")
     assert call[2:4] == ["--repo", "ghe.example.com/team/proj"]
+
+
+def test_create_comment_posts_json_body_via_stdin_and_returns_the_id(
+    gh: GitHub, fake_gh: FakeGitHub, branches: dict[str, str]
+) -> None:
+    pr = create_first(gh)
+    body = "<!-- pstack-pr: stack -->\nStacked PRs:\n * __->__#1\n'quotes' $x"
+
+    comment = gh.create_comment(pr.number, body)
+
+    assert comment == Comment(id=1001, body=body)
+    assert fake_gh.calls("api", "--hostname", "github.com", "--method") == [
+        [
+            "api", "--hostname", "github.com", "--method", "POST",
+            "repos/octo/widgets/issues/1/comments", "--input", "-",
+        ]
+    ]  # fmt: skip
+    assert fake_gh.comments(1) == [
+        {
+            "databaseId": 1001,
+            "id": "IC_1001",
+            "url": f"{PR1_URL}#issuecomment-1001",
+            "body": body,
+        }
+    ]
+
+
+def test_create_comment_on_missing_pr_fails(
+    gh: GitHub, fake_gh: FakeGitHub, branches: dict[str, str]
+) -> None:
+    with pytest.raises(CommandError):
+        gh.create_comment(404, "x")
+
+
+def test_edit_comment_replaces_the_body(
+    gh: GitHub, fake_gh: FakeGitHub, branches: dict[str, str]
+) -> None:
+    pr = create_first(gh)
+    comment = gh.create_comment(pr.number, "old")
+
+    gh.edit_comment(comment.id, "new\nbody")
+
+    assert fake_gh.calls("api", "--hostname", "github.com", "--method", "PATCH") == [
+        [
+            "api", "--hostname", "github.com", "--method", "PATCH",
+            "repos/octo/widgets/issues/comments/1001", "--input", "-",
+        ]
+    ]  # fmt: skip
+    assert [c["body"] for c in fake_gh.comments(1)] == ["new\nbody"]
+
+
+def test_edit_comment_of_unknown_id_fails(
+    gh: GitHub, fake_gh: FakeGitHub, branches: dict[str, str]
+) -> None:
+    with pytest.raises(CommandError):
+        gh.edit_comment(5555, "x")
+
+
+def test_view_pr_and_view_prs_return_comments(
+    gh: GitHub, fake_gh: FakeGitHub, branches: dict[str, str]
+) -> None:
+    pr = create_first(gh)
+    first = gh.create_comment(pr.number, "one")
+    second = gh.create_comment(pr.number, "two")
+    expected = [Comment(id=first.id, body="one"), Comment(id=second.id, body="two")]
+
+    assert gh.view_pr(pr.number).comments == expected
+    assert gh.view_prs([pr.number])[pr.number].comments == expected
+    assert gh.find_open_pr("testbot/stack/1") is not None
+    assert (gh.find_open_pr("testbot/stack/1") or pr).comments == expected
+
+
+def test_comment_calls_use_the_repository_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: list[tuple[tuple[str, ...], str | None]] = []
+
+    def fake(self: GitHub, *args: str, input: str | None = None) -> str:  # noqa: A002
+        recorded.append((args, input))
+        return json.dumps({"id": 12, "body": "b"})
+
+    monkeypatch.setattr(GitHub, "_gh", fake)
+    ghe = GitHub(Repo(host="ghe.example.com", owner="team", name="proj"))
+    assert ghe.create_comment(3, "b") == Comment(id=12, body="b")
+    ghe.edit_comment(12, "c")
+    assert recorded == [
+        (
+            (
+                "api", "--hostname", "ghe.example.com", "--method", "POST",
+                "repos/team/proj/issues/3/comments", "--input", "-",
+            ),
+            json.dumps({"body": "b"}),
+        ),
+        (
+            (
+                "api", "--hostname", "ghe.example.com", "--method", "PATCH",
+                "repos/team/proj/issues/comments/12", "--input", "-",
+            ),
+            json.dumps({"body": "c"}),
+        ),
+    ]  # fmt: skip
+
+
+def test_create_comment_without_id_in_response_is_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(GitHub, "_gh", lambda self, *a, **kw: "{}")
+    with pytest.raises(PstackError, match="did not return the comment"):
+        GitHub(OCTO).create_comment(1, "b")
 
 
 def test_full_lifecycle_against_fake(

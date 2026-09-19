@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from pstack_pr.cli import main
+from pstack_pr.stack import STACK_COMMENT_MARKER
 
 TESTS_DIR = Path(__file__).parent
 FAKE_GH = TESTS_DIR / "fake_gh.py"
@@ -101,6 +102,26 @@ class Remote:
         return git("log", "-1", "--format=%B", sha, cwd=self.path)
 
 
+PR_WRITES = (["pr", "create"], ["pr", "edit"], ["pr", "ready"], ["pr", "close"])
+# How a gh call that creates or edits a stack comment starts (REST via gh api).
+COMMENT_CALL = ["api", "--hostname"]
+
+
+def stack_comment(numbers: list[int], current: int) -> str:
+    """The comment the tool keeps on PR ``current`` (``numbers`` bottom first)."""
+    lines = ["Stacked PRs:"]
+    lines += [f" * {'__->__' if n == current else ''}#{n}" for n in reversed(numbers)]
+    return STACK_COMMENT_MARKER + "\n" + "\n".join(lines)
+
+
+def is_write_call(call: list[str]) -> bool:
+    if call[:2] in PR_WRITES:
+        return True
+    if call[:1] == ["api"] and "--method" in call:
+        return call[call.index("--method") + 1] in ("POST", "PATCH", "DELETE")
+    return False
+
+
 @dataclass
 class FakeGitHub:
     """Handle on the fake ``gh`` state."""
@@ -122,12 +143,32 @@ class FakeGitHub:
         return [c for c in self.state()["calls"] if c[: len(prefix)] == list(prefix)]
 
     def write_calls(self) -> list[list[str]]:
+        """Every gh invocation that changes something on the fake GitHub."""
+        return [c for c in self.state()["calls"] if is_write_call(c)]
+
+    def comments(self, number: int) -> list[dict[str, Any]]:
+        return list(self.pr(number).get("comments", []))
+
+    def stack_comments(self, number: int) -> list[str]:
+        """Bodies of the tool's comments on PR ``number``; at most one expected."""
         return [
-            c
-            for c in self.state()["calls"]
-            if c[:2]
-            in (["pr", "create"], ["pr", "edit"], ["pr", "ready"], ["pr", "close"])
+            c["body"]
+            for c in self.comments(number)
+            if c["body"].startswith(STACK_COMMENT_MARKER)
         ]
+
+    def remove_comments(self, number: int) -> None:
+        data = self.state()
+        data["prs"][str(number)]["comments"] = []
+        self.state_path.write_text(json.dumps(data))
+
+    def set_comment(self, comment_id: int, body: str) -> None:
+        data = self.state()
+        for pr in data["prs"].values():
+            for comment in pr.get("comments", []):
+                if comment["databaseId"] == comment_id:
+                    comment["body"] = body
+        self.state_path.write_text(json.dumps(data))
 
     def set_body(self, number: int, body: str) -> None:
         data = self.state()
@@ -274,4 +315,13 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("python_files", "test_*.py")
 
 
-__all__ = ["FakeGitHub", "Iterator", "Remote", "RunExport", "Work", "git"]
+__all__ = [
+    "COMMENT_CALL",
+    "FakeGitHub",
+    "Iterator",
+    "Remote",
+    "RunExport",
+    "Work",
+    "git",
+    "stack_comment",
+]

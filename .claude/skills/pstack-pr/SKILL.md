@@ -27,6 +27,8 @@ Use whichever form is available:
 5. One commit per reviewable change, with a good message. The first line
    becomes the PR title and the rest the PR description; fix messages with
    `git rebase -i` (`reword`) before exporting instead of editing PRs later.
+   The list of PRs in the stack goes into a comment on each PR, never into
+   the description, so squash merges get a clean commit message.
 
 ## Export
 
@@ -63,7 +65,7 @@ Plan:
    3. rewrite 1 commit message to embed stack-info (git commit-tree; ...)
    4. move feature from a082cd30 to the rewritten tip (git update-ref, ...)
    5. push the stack to origin (--atomic --force-with-lease): alice/stack/3
-   6. update PR #11: body (cross-links)
+   6. update PR #11: stack comment
    ...
 Dry run: nothing was changed.
 ```
@@ -100,6 +102,8 @@ already pushed that commit; it is reused, not duplicated.
   the user asks for it.
 - Never push, rebase or delete `<user>/stack/N` branches manually; export owns
   them.
+- Never delete or edit the `<!-- pstack-pr: stack -->` comment on a PR; export
+  finds the stack list by that line and would otherwise post a second one.
 - Do not run export during a rebase.
 - If export is interrupted or fails midway, re-run it; it resumes and reuses
   everything already pushed.

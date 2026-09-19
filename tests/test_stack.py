@@ -6,9 +6,10 @@ import pytest
 
 from pstack_pr.errors import PstackError
 from pstack_pr.git import Commit, Identity
-from pstack_pr.github import PullRequest
+from pstack_pr.github import Comment, PullRequest
 from pstack_pr.stack import (
     CROSS_LINKS_DELIMITER,
+    STACK_COMMENT_MARKER,
     TMP_DRAFT_MARKER,
     TOC_CURRENT_MARKER,
     TOC_HEADER,
@@ -20,10 +21,12 @@ from pstack_pr.stack import (
     check_linear,
     check_titles,
     description_from_existing_body,
+    find_stack_comment,
     has_tmp_draft_marker,
     parse_stack_info,
     pr_body,
     pr_title,
+    stack_comment_body,
     strip_stack_info,
     title_and_description,
     toc,
@@ -638,194 +641,176 @@ def test_description_from_existing_body_splits_on_first_delimiter_only() -> None
 # --------------------------------------------------------------------------- #
 # pr_body
 # --------------------------------------------------------------------------- #
-def test_pr_body_single_entry_is_description_only() -> None:
+def test_pr_body_is_description_only() -> None:
     entries = linked_stack(["Add a\n\nBody of a.\n"])
-    assert pr_body(entries[0], entries) == "Body of a."
+    assert pr_body(entries[0]) == "Body of a."
 
 
-def test_pr_body_single_entry_without_description_is_empty() -> None:
+def test_pr_body_without_description_is_empty() -> None:
     entries = linked_stack(["Add a\n"])
-    assert pr_body(entries[0], entries) == ""
+    assert pr_body(entries[0]) == ""
 
 
-def test_pr_body_single_entry_without_toc_flag() -> None:
-    entries = linked_stack(["Add a\n\nBody of a.\n"])
-    assert pr_body(entries[0], entries, with_toc=False) == "Body of a."
-
-
-def test_pr_body_single_entry_drops_trailer() -> None:
+def test_pr_body_drops_trailer() -> None:
     entries = linked_stack([f"Add a\n\nBody of a.\n\n{INFO.line}\n"])
-    assert pr_body(entries[0], entries) == "Body of a."
+    body = pr_body(entries[0])
+    assert body == "Body of a."
+    assert "stack-info" not in body
 
 
-def test_pr_body_single_entry_works_without_pr() -> None:
-    entries = [make_entry(0, "Add a\n\nBody.\n", branch="testbot/stack/1")]
-    assert pr_body(entries[0], entries) == "Body."
+def test_pr_body_works_without_pr() -> None:
+    entry = make_entry(0, "Add a\n\nBody.\n", branch="testbot/stack/1")
+    assert pr_body(entry) == "Body."
 
 
-def test_pr_body_multi_entry_full_layout() -> None:
-    entries = linked_stack(["Add a\n", "Add b\n\nBody of b.\n", "Add c\n"])
-    assert pr_body(entries[1], entries) == (
-        "Stacked PRs:\n * #3\n * __->__#2\n * #1\n\n--- --- ---\n\n### Add b\n\nBody of b."
-    )
-
-
-def test_pr_body_multi_entry_marks_each_entry_itself() -> None:
-    entries = linked_stack(["Add a\n", "Add b\n", "Add c\n"])
-    assert pr_body(entries[0], entries).startswith(
-        "Stacked PRs:\n * #3\n * #2\n * __->__#1\n\n"
-    )
-    assert pr_body(entries[2], entries).startswith(
-        "Stacked PRs:\n * __->__#3\n * #2\n * #1\n\n"
-    )
-
-
-def test_pr_body_multi_entry_empty_description_ends_with_title() -> None:
-    entries = linked_stack(["Add a\n", "Add b\n"])
-    body = pr_body(entries[0], entries)
-    assert body == "Stacked PRs:\n * #2\n * __->__#1\n\n--- --- ---\n\n### Add a"
-    assert not body.endswith("\n")
-
-
-def test_pr_body_multi_entry_multi_paragraph_description() -> None:
+def test_pr_body_multi_paragraph_description() -> None:
     entries = linked_stack(["Add a\n\nPara 1.\n\nPara 2.\n", "Add b\n"])
-    assert pr_body(entries[0], entries) == (
-        "Stacked PRs:\n * #2\n * __->__#1\n\n--- --- ---\n\n### Add a\n\nPara 1.\n\nPara 2."
+    assert pr_body(entries[0]) == "Para 1.\n\nPara 2."
+
+
+def test_pr_body_has_no_stack_list_heading_or_delimiter() -> None:
+    # The stack list lives in a comment, so a squash merge that copies the PR
+    # body into the commit message gets only the description.
+    entries = linked_stack(["Add a\n\nBody.\n", "Add b\n", "Add c\n"])
+    for entry in entries:
+        body = pr_body(entry)
+        assert TOC_HEADER not in body
+        assert CROSS_LINKS_DELIMITER not in body
+        assert "###" not in body
+
+
+def test_pr_body_keep_body_keeps_existing_text() -> None:
+    entries = linked_stack(["Add a\n\nFrom the commit.\n"])
+    body = pr_body(entries[0], existing_body="Edited on GitHub.\n")
+    assert body == "Edited on GitHub."
+
+
+def test_pr_body_keep_body_empty_existing_body() -> None:
+    entries = linked_stack(["Add a\n\nFrom the commit.\n"])
+    assert pr_body(entries[0], existing_body="") == ""
+
+
+def test_pr_body_keep_body_strips_legacy_stack_list_and_heading() -> None:
+    entries = linked_stack(["Add a\n", "Add b\n\nFrom the commit.\n", "Add c\n"])
+    existing = (
+        "Stacked PRs:\n * #9\n * __->__#2\n\n--- --- ---\n\n### Add b\n\n"
+        "Edited on GitHub.\n"
+    )
+    body = pr_body(entries[1], existing_body=existing)
+    assert body == "Edited on GitHub."
+
+
+def test_pr_body_keep_body_is_idempotent() -> None:
+    entries = linked_stack(["Add a\n", "Add b\n\nBody of b.\n", "Add c\n"])
+    generated = pr_body(entries[1])
+    assert pr_body(entries[1], existing_body=generated) == generated
+
+
+def test_pr_body_keep_body_drops_tmp_draft_marker() -> None:
+    entries = linked_stack(["Add a\n", "Add b\n\nBody of b.\n"])
+    generated = pr_body(entries[1])
+    marked = generated.rstrip() + "\n\n" + TMP_DRAFT_MARKER
+    assert has_tmp_draft_marker(marked)
+    body = pr_body(entries[1], existing_body=marked)
+    assert body == generated
+    assert not has_tmp_draft_marker(body)
+
+
+# --------------------------------------------------------------------------- #
+# stack_comment_body / find_stack_comment
+# --------------------------------------------------------------------------- #
+def test_stack_comment_marker_is_an_html_comment() -> None:
+    assert STACK_COMMENT_MARKER.startswith("<!--")
+    assert STACK_COMMENT_MARKER.endswith("-->")
+
+
+def test_stack_comment_body_is_marker_then_toc() -> None:
+    entries = linked_stack(["Add a\n", "Add b\n\nBody of b.\n", "Add c\n"])
+    assert stack_comment_body(entries[1], entries) == (
+        f"{STACK_COMMENT_MARKER}\nStacked PRs:\n * #3\n * __->__#2\n * #1"
     )
 
 
-def test_pr_body_multi_entry_uses_non_sequential_pr_numbers() -> None:
+def test_stack_comment_body_marks_each_entry_itself() -> None:
+    entries = linked_stack(["Add a\n", "Add b\n", "Add c\n"])
+    assert stack_comment_body(entries[0], entries).endswith(
+        "Stacked PRs:\n * #3\n * #2\n * __->__#1"
+    )
+    assert stack_comment_body(entries[2], entries).endswith(
+        "Stacked PRs:\n * __->__#3\n * #2\n * #1"
+    )
+
+
+def test_stack_comment_body_single_entry() -> None:
+    entries = linked_stack(["Add a\n"])
+    assert stack_comment_body(entries[0], entries).endswith("Stacked PRs:\n * __->__#1")
+
+
+def test_stack_comment_body_uses_non_sequential_pr_numbers() -> None:
     entries = linked_stack(["Add a\n", "Add b\n"])
     assert entries[0].pr is not None
     assert entries[1].pr is not None
     entries[0].pr.number = 40
     entries[1].pr.number = 17
-    assert pr_body(entries[1], entries).startswith(
-        "Stacked PRs:\n * __->__#17\n * #40\n\n"
+    assert stack_comment_body(entries[1], entries).endswith(
+        "Stacked PRs:\n * __->__#17\n * #40"
     )
 
 
-def test_pr_body_multi_entry_drops_trailer_from_description() -> None:
-    entries = linked_stack([f"Add a\n\nBody.\n\n{INFO.line}\n", "Add b\n"])
-    body = pr_body(entries[0], entries)
-    assert body.endswith("### Add a\n\nBody.")
-    assert "stack-info" not in body
-
-
-def test_pr_body_multi_entry_without_toc_is_description_only() -> None:
-    entries = linked_stack(["Add a\n", "Add b\n\nBody of b.\n"])
-    assert pr_body(entries[1], entries, with_toc=False) == "Body of b."
-
-
-def test_pr_body_multi_entry_without_toc_does_not_need_pr_numbers() -> None:
-    entries = [
-        make_entry(0, "Add a\n", branch="testbot/stack/1"),
-        make_entry(1, "Add b\n\nBody of b.\n", branch="testbot/stack/2"),
-    ]
-    assert pr_body(entries[1], entries, with_toc=False) == "Body of b."
-    assert pr_body(entries[0], entries, with_toc=False) == ""
-
-
-def test_pr_body_raises_when_another_entry_has_no_pr() -> None:
+def test_stack_comment_body_raises_when_another_entry_has_no_pr() -> None:
     entries = linked_stack(["Add a\n", "Add b\n"])
     entries[1].pr = None
     with pytest.raises(PstackError, match="needs all PR numbers"):
-        pr_body(entries[0], entries)
+        stack_comment_body(entries[0], entries)
 
 
-def test_pr_body_raises_when_entry_itself_has_no_pr() -> None:
+def test_stack_comment_body_raises_when_entry_itself_has_no_pr() -> None:
     entries = linked_stack(["Add a\n", "Add b\n"])
     entries[0].pr = None
     with pytest.raises(PstackError, match="needs all PR numbers"):
-        pr_body(entries[0], entries)
+        stack_comment_body(entries[1], entries)
 
 
-def test_pr_body_raises_when_entry_is_outside_entries_and_has_no_pr() -> None:
+def test_stack_comment_body_raises_when_entry_is_outside_entries() -> None:
     entries = linked_stack(["Add a\n", "Add b\n"])
     outsider = make_entry(5, "Add z\n", branch="testbot/stack/9")
     with pytest.raises(PstackError, match="needs all PR numbers"):
-        pr_body(outsider, entries)
+        stack_comment_body(outsider, entries)
 
 
-def test_pr_body_keep_body_single_entry_keeps_existing_text() -> None:
-    entries = linked_stack(["Add a\n\nFrom the commit.\n"])
-    body = pr_body(entries[0], entries, existing_body="Edited on GitHub.\n")
-    assert body == "Edited on GitHub."
+def test_find_stack_comment_none_without_comments() -> None:
+    assert find_stack_comment(make_pr(1, head="testbot/stack/1")) is None
 
 
-def test_pr_body_keep_body_single_entry_empty_existing_body() -> None:
-    entries = linked_stack(["Add a\n\nFrom the commit.\n"])
-    assert pr_body(entries[0], entries, existing_body="") == ""
+def test_find_stack_comment_ignores_other_comments() -> None:
+    pr = make_pr(1, head="testbot/stack/1")
+    pr.comments = [
+        Comment(id=5, body="LGTM"),
+        Comment(id=6, body="Stacked PRs:\n * #1"),
+    ]
+    assert find_stack_comment(pr) is None
 
 
-def test_pr_body_keep_body_multi_entry_keeps_text_after_delimiter() -> None:
-    entries = linked_stack(["Add a\n", "Add b\n\nFrom the commit.\n", "Add c\n"])
-    existing = "Stacked PRs:\n * #9\n * __->__#2\n\n--- --- ---\n\nEdited on GitHub.\n"
-    body = pr_body(entries[1], entries, existing_body=existing)
-    head, delimiter, tail = body.partition(CROSS_LINKS_DELIMITER)
-    assert head == "Stacked PRs:\n * #3\n * __->__#2\n * #1\n\n"
-    assert delimiter == CROSS_LINKS_DELIMITER
-    assert tail.strip().endswith("Edited on GitHub.")
-    assert "From the commit." not in body
-    assert "#9" not in body
+def test_find_stack_comment_finds_marked_comment() -> None:
+    pr = make_pr(1, head="testbot/stack/1")
+    ours = Comment(id=7, body=f"{STACK_COMMENT_MARKER}\nStacked PRs:\n * __->__#1")
+    pr.comments = [Comment(id=5, body="LGTM"), ours, Comment(id=9, body="Thanks")]
+    assert find_stack_comment(pr) is ours
 
 
-def test_pr_body_keep_body_multi_entry_without_toc_ignores_commit_message() -> None:
-    entries = linked_stack(["Add a\n", "Add b\n\nFrom the commit.\n"])
-    existing = "Stacked PRs:\n * #9\n\n--- --- ---\n\nEdited on GitHub.\n"
-    body = pr_body(entries[1], entries, existing_body=existing, with_toc=False)
-    assert body == "Edited on GitHub."
+def test_find_stack_comment_returns_first_marked_comment() -> None:
+    pr = make_pr(1, head="testbot/stack/1")
+    first = Comment(id=1, body=f"{STACK_COMMENT_MARKER}\nold")
+    second = Comment(id=2, body=f"{STACK_COMMENT_MARKER}\nnew")
+    pr.comments = [first, second]
+    assert find_stack_comment(pr) is first
 
 
-def test_pr_body_keep_body_existing_body_without_delimiter_is_kept_whole() -> None:
-    entries = linked_stack(["Add a\n", "Add b\n\nFrom the commit.\n"])
-    body = pr_body(entries[1], entries, existing_body="Plain body.\n")
-    assert body.startswith("Stacked PRs:\n * __->__#2\n * #1\n\n--- --- ---\n\n")
-    assert body.endswith("Plain body.")
-    assert "From the commit." not in body
-
-
-def test_pr_body_keep_body_is_idempotent_on_generated_body() -> None:
-    entries = linked_stack(["Add a\n", "Add b\n\nBody of b.\n", "Add c\n"])
-    generated = pr_body(entries[1], entries)
-    assert pr_body(entries[1], entries, existing_body=generated) == generated
-
-
-def test_pr_body_keep_body_has_single_title_header() -> None:
-    entries = linked_stack(["Add a\n", "Add b\n\nBody of b.\n", "Add c\n"])
-    generated = pr_body(entries[1], entries)
-    body = pr_body(entries[1], entries, existing_body=generated)
-    assert body.count("### Add b") == 1
-    assert body.count("###") == 1
-
-
-def test_pr_body_keep_body_heading_follows_retitled_commit() -> None:
-    entries = linked_stack(["Add a\n", "Add b\n\nBody of b.\n", "Add c\n"])
-    generated = pr_body(entries[1], entries)
-    entries[1].commit = make_commit("Add b (renamed)\n\nIgnored.\n", sha=sha_for(2))
-    body = pr_body(entries[1], entries, existing_body=generated)
-    assert body == (
-        "Stacked PRs:\n * #3\n * __->__#2\n * #1\n\n--- --- ---\n\n"
-        "### Add b (renamed)\n\nBody of b."
-    )
-    assert "### Add b\n" not in body
-    assert "Ignored." not in body
-
-
-def test_pr_body_keep_body_drops_tmp_draft_marker() -> None:
-    entries = linked_stack(["Add a\n", "Add b\n\nBody of b.\n"])
-    generated = pr_body(entries[1], entries)
-    marked = generated.rstrip() + "\n\n" + TMP_DRAFT_MARKER
-    assert has_tmp_draft_marker(marked)
-    body = pr_body(entries[1], entries, existing_body=marked)
-    assert body == generated
-    assert not has_tmp_draft_marker(body)
-
-
-def test_pr_body_keep_body_single_entry_drops_tmp_draft_marker() -> None:
-    entries = linked_stack(["Add a\n\nFrom the commit.\n"])
-    existing = f"Edited on GitHub.\n\n{TMP_DRAFT_MARKER}\n"
-    assert pr_body(entries[0], entries, existing_body=existing) == "Edited on GitHub."
+def test_find_stack_comment_tolerates_crlf_and_leading_whitespace() -> None:
+    pr = make_pr(1, head="testbot/stack/1")
+    ours = Comment(id=3, body=f"\r\n {STACK_COMMENT_MARKER}\r\nStacked PRs:\r\n")
+    pr.comments = [ours]
+    assert find_stack_comment(pr) is ours
 
 
 def test_has_tmp_draft_marker() -> None:

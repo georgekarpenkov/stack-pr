@@ -266,6 +266,12 @@ class GhRepo:
             )
         return pr
 
+    def stack_comments(self, number: int) -> list[str]:
+        """Bodies of the tool's stack comments on PR ``number`` (first page)."""
+        out = self.gh("api", f"repos/{self.slug}/issues/{number}/comments")
+        bodies = [str(c.get("body") or "") for c in json.loads(out or "[]")]
+        return [normalize(b) for b in bodies if b.lstrip().startswith("<!-- pstack-pr")]
+
     def open_prs(self) -> list[PrInfo]:
         """Open pull requests whose head branch belongs to this run."""
         out = self.gh(

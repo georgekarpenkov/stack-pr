@@ -6,6 +6,9 @@ the fake behaves like GitHub where it matters:
 
 * ``pr create`` requires both branches to exist and the head to have commits
   that are not in the base;
+* issue comments can be listed (``--json comments``, GraphQL), created
+  (``api --method POST .../issues/N/comments``) and edited
+  (``api --method PATCH .../issues/comments/ID``);
 * the ``post-receive`` entry point (installed as a hook in the bare repo)
   closes every open PR whose head branch no longer has commits beyond its base
   branch, which is what GitHub does after a push.
@@ -52,6 +55,12 @@ class State:
         ref = ref.strip().rstrip("/")
         number = ref.rsplit("/", 1)[-1].lstrip("#")
         return self.prs.get(number)
+
+    def new_comment_id(self) -> int:
+        # Well away from PR numbers so that mixing them up shows in tests.
+        comment_id = int(self.data.get("next_comment_id", 1001))
+        self.data["next_comment_id"] = comment_id + 1
+        return comment_id
 
 
 def git_remote(*args: str) -> subprocess.CompletedProcess[str]:
@@ -106,13 +115,22 @@ BOOL_FLAGS = {"draft", "undo", "web", "fill"}
 
 
 def to_json(pr: dict[str, Any], fields: str) -> dict[str, Any]:
-    return {f: pr[f] for f in fields.split(",") if f in pr}
+    """Like ``gh --json``: comments carry the node id and url, not databaseId."""
+    data = {f: pr[f] for f in fields.split(",") if f in pr}
+    if "comments" in data:
+        data["comments"] = [
+            {k: v for k, v in c.items() if k != "databaseId"} for c in data["comments"]
+        ]
+    return data
 
 
 def cmd_api(state: State, args: list[str]) -> None:
     positional, flags = parse_flags(args)
     if positional[:1] == ["graphql"]:
         graphql(state, flags)
+        return
+    if positional and positional[0].startswith("repos/"):
+        rest_call(state, positional[0], flags)
         return
     if positional[:1] == ["user"]:
         login = os.environ.get("FAKE_GH_USER", "testbot")
@@ -124,16 +142,71 @@ def cmd_api(state: State, args: list[str]) -> None:
     die(f"fake gh: unsupported api call {args}")
 
 
+COMMENTS_SELECTION_RE = re.compile(r"comments\(first: \d+\) \{ nodes \{ ([^}]*) \} \}")
+
+
+def rest_call(state: State, path: str, flags: dict[str, list[str]]) -> None:
+    """The two REST endpoints the tool uses, for issue comments."""
+    method = flags.get("method", ["GET"])[0]
+    payload = json.loads(sys.stdin.read()) if flags.get("input") == ["-"] else {}
+    parts = path.split("/")
+    if method == "POST" and parts[3:4] == ["issues"] and parts[5:] == ["comments"]:
+        pr = state.prs.get(parts[4])
+        if pr is None:
+            die(f"gh: Not Found (HTTP 404)\n{path}")
+        number = int(parts[4])
+        comment_id = state.new_comment_id()
+        comment = {
+            "databaseId": comment_id,
+            "id": f"IC_{comment_id}",
+            "url": f"{pr['url']}#issuecomment-{comment_id}",
+            "body": payload.get("body", ""),
+        }
+        pr.setdefault("comments", []).append(comment)
+        print(
+            json.dumps(
+                {
+                    "id": comment_id,
+                    "body": comment["body"],
+                    "html_url": comment["url"],
+                    "issue_number": number,
+                }
+            )
+        )
+        return
+    if method == "PATCH" and parts[3:5] == ["issues", "comments"] and len(parts) == 6:
+        for pr in state.prs.values():
+            for comment in pr.get("comments", []):
+                if str(comment["databaseId"]) == parts[5]:
+                    comment["body"] = payload.get("body", comment["body"])
+                    print(
+                        json.dumps(
+                            {
+                                "id": comment["databaseId"],
+                                "body": comment["body"],
+                                "html_url": comment["url"],
+                            }
+                        )
+                    )
+                    return
+        die(f"gh: Not Found (HTTP 404)\n{path}")
+    die(f"fake gh: unsupported REST call {method} {path}")
+
+
 def graphql(state: State, flags: dict[str, list[str]]) -> None:
     """Answer the batched pull request lookup the tool sends.
 
-    Only the shape ``alias: pullRequest(number: N) { fields }`` is understood.
-    Like gh, a missing pull request produces a payload with ``errors`` and a
-    non-zero exit status.
+    Only the shape ``alias: pullRequest(number: N) { fields }`` is understood,
+    where the fields may include a ``comments(first: N) { nodes { ... } }``
+    selection. Like gh, a missing pull request produces a payload with
+    ``errors`` and a non-zero exit status.
     """
     query = flags["query"][0]
     wanted = re.findall(r"(\w+): pullRequest\(number: (\d+)\)", query)
-    fields_match = re.search(r"pullRequest\(number: \d+\) \{ ([^}]*) \}", query)
+    comments_match = COMMENTS_SELECTION_RE.search(query)
+    comment_fields = comments_match.group(1).split() if comments_match else None
+    query_flat = COMMENTS_SELECTION_RE.sub("", query)
+    fields_match = re.search(r"pullRequest\(number: \d+\) \{ ([^}]*) \}", query_flat)
     fields = fields_match.group(1).split() if fields_match else []
     data: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
@@ -149,7 +222,15 @@ def graphql(state: State, flags: dict[str, list[str]]) -> None:
                 }
             )
         else:
-            data[alias] = {f: pr[f] for f in fields if f in pr}
+            node = {f: pr[f] for f in fields if f in pr}
+            if comment_fields is not None:
+                node["comments"] = {
+                    "nodes": [
+                        {f: c[f] for f in comment_fields if f in c}
+                        for c in pr.get("comments", [])
+                    ]
+                }
+            data[alias] = node
     payload: dict[str, Any] = {"data": {"repository": data}}
     if errors:
         payload["errors"] = errors
@@ -246,6 +327,7 @@ def pr_create(state: State, repo: str, flags: dict[str, list[str]]) -> None:
         "baseRefName": base,
         "headRefName": head,
         "reviewers": flags.get("reviewer", []),
+        "comments": [],
     }
     state.prs[str(number)] = pr
     print(pr["url"])

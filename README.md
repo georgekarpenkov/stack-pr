@@ -45,7 +45,10 @@ pstack-pr export                    # update the PRs
 ```
 
 The first line of each commit message becomes the PR title and the rest
-becomes the PR description, so write them for the reviewer. Re-running
+becomes the PR description, so write them for the reviewer. The list of PRs
+in the stack is posted as a comment on each PR (and kept up to date), not
+written into the description: GitHub copies the description into the
+squash-merge commit message, and the list would be noise there. Re-running
 `export` after any change to the branch updates exactly the PRs whose commit,
 position or message changed.
 
@@ -90,8 +93,9 @@ steps run in this order:
    compare-and-swap `git update-ref` transaction. This is the only local write.
 6. Push the rewritten commits to all stack branches
    (`--atomic --force-with-lease`).
-7. Bring titles, descriptions (with the cross-links list) and base branches of
-   the PRs up to date, and undo the temporary draft state from step 1.
+7. Bring titles, descriptions and base branches of the PRs up to date, post
+   or refresh the stack comment on each PR, and undo the temporary draft state
+   from step 1.
 
 A first export of three commits looks like this with `--dry-run`:
 
@@ -110,9 +114,9 @@ Plan:
    5. rewrite 3 commit messages to embed stack-info (git commit-tree; file contents, authors and dates are unchanged)
    6. move feature from a082cd30 to the rewritten tip (git update-ref, only if it is still at a082cd30)
    7. push the stack to origin (--atomic --force-with-lease): alice/stack/1, alice/stack/2, alice/stack/3
-   8. update the new PR for 9c0d1e2f: body (cross-links)
-   9. update the new PR for 5e6f7a8b: body (cross-links)
-  10. update the new PR for a082cd30: body (cross-links)
+   8. update the new PR for 9c0d1e2f: stack comment
+   9. update the new PR for 5e6f7a8b: stack comment
+  10. update the new PR for a082cd30: stack comment
 
 Dry run: nothing was changed.
 ```
@@ -165,9 +169,16 @@ as it runs, `-vv` for every `git` and `gh` command.
   the commits, export refuses to run, because nothing local could record the
   `stack-info:` trailers and every re-run would create new PRs.
 - A re-export with nothing to do makes no write calls to git or GitHub. PRs are
-  only edited when their title, description or base actually differs. Commits
-  that did not change cost nothing: no fetch, no push, no rewrite, no PR edit;
-  the PR lookups for the whole stack are one request.
+  only edited when their title, description or base actually differs, and the
+  stack comment is only rewritten when the list changed. Commits that did not
+  change cost nothing: no fetch, no push, no rewrite, no PR edit; the PR
+  lookups for the whole stack (comments included) are one request.
+- The stack comment starts with `<!-- pstack-pr: stack -->`, which is how the
+  tool finds it again; do not delete that line. Stacks of a single PR get no
+  comment. PRs created by older versions, which carried the list at the top of
+  the description, are cleaned up on the next export: the list and the
+  generated `### <title>` heading are removed from the description and the
+  comment is posted instead.
 - When commits are reordered, a PR whose base branch now sits above it would
   be auto-closed by GitHub the moment the branches are pushed. Such PRs are
   temporarily retargeted to `main` and marked draft, then restored. While a PR
@@ -187,7 +198,7 @@ as it runs, `-vv` for every `git` and `gh` command.
 | `-H`, `--head HEAD` | `HEAD` | top of the stack, inclusive |
 | `-d`, `--draft` | off | create new pull requests as drafts |
 | `--reviewer REVIEWER` | | comma-separated GitHub handles to request reviews from on new PRs |
-| `--keep-body` | off | keep existing PR descriptions and only refresh the cross-links |
+| `--keep-body` | off | keep existing PR descriptions instead of regenerating them from the commit messages |
 | `--branch-name-template T` | `$USERNAME/stack` | template for stack branch names |
 | `-v`, `--verbose` | off | show the plan and progress while it runs; `-vv` also shows every git and gh command |
 

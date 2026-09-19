@@ -1,5 +1,18 @@
 # Top of tree
 
+* The list of the stack's pull requests moved from the top of each PR
+  description into a comment on the PR, which `export` posts once the PR
+  numbers are known and edits in place afterwards. GitHub copies the PR
+  description into the squash-merge commit message, so the description now
+  holds nothing but the commit message body: no `Stacked PRs:` list, no
+  `--- --- ---` delimiter and no `### <title>` heading. Descriptions written
+  by older versions are cleaned up on the next export. A stack of one PR gets
+  no comment. The `stack-info:` commit trailer is unchanged.
+* `--keep-body` keeps the description exactly as it is on GitHub (apart from
+  the removed generated parts); there are no cross-links left to refresh.
+* The batched PR lookup also fetches the first 100 comments of each PR, which
+  is how the stack comment is found; no extra request is made.
+
 # Version 0.2.2
 
 * No more `git fetch` of the whole remote. Planning fetches the target branch

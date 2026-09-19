@@ -8,11 +8,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-from tests.conftest import FakeGitHub, Remote, RunExport, Work, git
+from tests.conftest import (
+    COMMENT_CALL,
+    FakeGitHub,
+    Remote,
+    RunExport,
+    Work,
+    git,
+    stack_comment,
+)
 
 REPO_URL = "https://github.com/octo/widgets"
 REPO_SLUG = "github.com/octo/widgets"  # what every ``gh --repo`` receives
-DELIMITER = "--- --- ---"
+DELIMITER = "--- --- ---"  # legacy body layout, still cleaned up
 IDENTITY_FORMAT = "--format=%an|%ae|%ad|%cn|%ce|%cd"
 PLAN_LINE_RE = re.compile(r"^\s*\d+\. (.+)$")
 
@@ -121,9 +129,9 @@ def test_dry_run_prints_stack_and_plan_without_changing_anything(
             "push the stack to origin (--atomic --force-with-lease): "
             "testbot/stack/1, testbot/stack/2, testbot/stack/3"
         ),
-        f"update the new PR for {a[:8]}: body (cross-links)",
-        f"update the new PR for {b[:8]}: body (cross-links)",
-        f"update the new PR for {c[:8]}: body (cross-links)",
+        f"update the new PR for {a[:8]}: stack comment",
+        f"update the new PR for {b[:8]}: stack comment",
+        f"update the new PR for {c[:8]}: stack comment",
     ]
     assert "Dry run: nothing was changed." in out
     assert "Exported" not in out
@@ -171,20 +179,31 @@ def test_fresh_export_creates_three_chained_pull_requests(
     ]
 
 
-def test_fresh_export_bodies_have_toc_newest_first_then_delimiter_and_title(
+def test_fresh_export_bodies_are_the_descriptions_only(
     work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
 ) -> None:
     run_export()
 
-    assert fake_gh.pr(1)["body"] == (
-        "Stacked PRs:\n * #3\n * #2\n * __->__#1\n\n--- --- ---\n\n### Add a"
-    )
-    assert fake_gh.pr(2)["body"] == (
-        "Stacked PRs:\n * #3\n * __->__#2\n * #1\n\n--- --- ---\n\n### Add b"
-    )
-    assert fake_gh.pr(3)["body"] == (
-        "Stacked PRs:\n * __->__#3\n * #2\n * #1\n\n--- --- ---\n\n### Add c"
-    )
+    # The commits have no description, so the bodies are empty: nothing the
+    # tool generates ends up in a squash-merge commit message.
+    assert [fake_gh.pr(n)["body"] for n in (1, 2, 3)] == ["", "", ""]
+
+
+def test_fresh_export_posts_one_stack_comment_per_pr_newest_first(
+    work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    run_export()
+
+    assert fake_gh.stack_comments(1) == [
+        "<!-- pstack-pr: stack -->\nStacked PRs:\n * #3\n * #2\n * __->__#1"
+    ]
+    assert fake_gh.stack_comments(2) == [
+        "<!-- pstack-pr: stack -->\nStacked PRs:\n * #3\n * __->__#2\n * #1"
+    ]
+    assert fake_gh.stack_comments(3) == [
+        "<!-- pstack-pr: stack -->\nStacked PRs:\n * __->__#3\n * #2\n * #1"
+    ]
+    assert [len(fake_gh.comments(n)) for n in (1, 2, 3)] == [1, 1, 1]
 
 
 def test_fresh_export_rewrites_messages_with_stack_info_trailer(
@@ -253,7 +272,7 @@ def test_fresh_export_leaves_reflog_entry_and_updates_head(
     assert work.head("feature") == work.head()
 
 
-def test_fresh_export_gh_calls_create_each_pr_once_and_edit_it_once(
+def test_fresh_export_gh_calls_create_each_pr_once_and_comment_on_it_once(
     work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
 ) -> None:
     run_export()
@@ -276,15 +295,20 @@ def test_fresh_export_gh_calls_create_each_pr_once_and_edit_it_once(
             "--title", "Add c", "--body-file", "-",
         ],
     ]  # fmt: skip
-    edits = fake_gh.calls("pr", "edit")
-    assert edits == [
-        ["pr", "edit", str(n), "--repo", REPO_SLUG, "--body-file", "-"]
+    # The body is right from the start, so the PRs are never edited; the
+    # stack list is posted as a comment once the numbers are known.
+    assert fake_gh.calls("pr", "edit") == []
+    comments = fake_gh.calls("api", "--hostname", "github.com", "--method")
+    assert comments == [
+        [
+            "api", "--hostname", "github.com", "--method", "POST",
+            f"repos/octo/widgets/issues/{n}/comments", "--input", "-",
+        ]
         for n in (1, 2, 3)
-    ]
-    assert [fake_gh.pr(n)["edits"] for n in (1, 2, 3)] == [1, 1, 1]
+    ]  # fmt: skip
     assert fake_gh.calls("pr", "ready") == []
     assert fake_gh.calls("pr", "close") == []
-    assert fake_gh.write_calls() == creates + edits
+    assert fake_gh.write_calls() == creates + comments
 
 
 def test_fresh_export_prints_only_the_result_block_by_default(
@@ -330,12 +354,12 @@ def test_fresh_export_verbose_prints_contacting_stack_plan_progress_then_result(
     ]
     assert len(plan_lines(out)) == 10
     assert lines[7].startswith("   1. push to origin: ")
-    assert lines[16] == f"  10. update the new PR for {c[:8]}: body (cross-links)"
+    assert lines[16] == f"  10. update the new PR for {c[:8]}: stack comment"
     assert lines[17] == ""
     assert lines[18].startswith("  [1/10] push to origin: ")
     assert lines[19] == f"  [2/10] create PR for {a[:8]}: testbot/stack/1 -> main"
     # Progress is described at execution time, when the PR numbers are known.
-    assert lines[27] == "  [10/10] update PR #3: body (cross-links)"
+    assert lines[27] == "  [10/10] update PR #3: stack comment"
     assert lines[28] == ""
     assert lines[29:] == [
         "Exported 3 pull requests (3 new):",
@@ -422,7 +446,7 @@ def test_amending_middle_commit_content_only_pushes_branches_above_it(
     branches_before = work.remote.branches()
     messages_before = work.messages()
     write_calls_before = fake_gh.write_calls()
-    assert len(write_calls_before) == 6  # 3 creates + 3 edits
+    assert len(write_calls_before) == 6  # 3 creates + 3 comments
 
     new_b = amend_content(work, b1, "b.txt", "b changed\n")
     rebase_onto(work, new_b, b1, "feature")
@@ -459,10 +483,8 @@ def test_amending_middle_commit_content_only_pushes_branches_above_it(
     assert work.git("show", f"{branches['testbot/stack/2']}:b.txt") == "b changed"
     prs = fake_gh.prs()
     assert sorted(prs) == [1, 2, 3]
-    assert [prs[n]["edits"] for n in (1, 2, 3)] == [1, 1, 1]
-    assert prs[2]["body"] == (
-        "Stacked PRs:\n * #3\n * __->__#2\n * #1\n\n--- --- ---\n\n### Add b"
-    )
+    assert all("edits" not in prs[n] for n in (1, 2, 3))
+    assert fake_gh.stack_comments(2) == [stack_comment([1, 2, 3], 2)]
     assert [prs[n]["state"] for n in (1, 2, 3)] == ["OPEN", "OPEN", "OPEN"]
     assert fake_gh.write_calls() == write_calls_before  # no new gh writes
 
@@ -487,7 +509,7 @@ def test_rewording_top_commit_title_updates_its_pr_title(
     assert rc == 0
     assert plan_lines(out) == [
         "push the stack to origin (--atomic --force-with-lease): testbot/stack/3",
-        "update PR #3: title, body (cross-links)",
+        "update PR #3: title",
     ]
     assert result_block(out) == [
         "Exported 3 pull requests (1 updated, 2 unchanged):",
@@ -499,15 +521,15 @@ def test_rewording_top_commit_title_updates_its_pr_title(
     assert work.head() == reworded  # nothing to rewrite: stack-info still valid
     prs = fake_gh.prs()
     assert prs[3]["title"] == "Add c (reworded)"
-    assert prs[3]["body"] == (
-        "Stacked PRs:\n * __->__#3\n * #2\n * #1\n\n--- --- ---\n\n### Add c (reworded)"
-    )
-    assert [prs[n]["edits"] for n in (1, 2, 3)] == [1, 1, 2]
+    assert prs[3]["body"] == ""
+    assert [prs[n].get("edits", 0) for n in (1, 2, 3)] == [0, 0, 1]
     assert [prs[n]["title"] for n in (1, 2)] == ["Add a", "Add b"]
-    assert fake_gh.calls("pr", "edit")[-1] == [
-        "pr", "edit", "3", "--repo", REPO_SLUG,
-        "--title", "Add c (reworded)", "--body-file", "-",
-    ]  # fmt: skip
+    # Only the title changed: the description is still empty and the stack
+    # comment still lists the same PRs.
+    assert fake_gh.calls("pr", "edit") == [
+        ["pr", "edit", "3", "--repo", REPO_SLUG, "--title", "Add c (reworded)"]
+    ]
+    assert fake_gh.stack_comments(3) == [stack_comment([1, 2, 3], 3)]
     branches = work.remote.branches()
     assert branches["testbot/stack/3"] == reworded
     assert branches["testbot/stack/1"] == branches_before["testbot/stack/1"]
@@ -552,10 +574,10 @@ def test_inserting_commit_between_a_and_b_relinks_bases(
             "push the stack to origin (--atomic --force-with-lease): "
             "testbot/stack/4, testbot/stack/2, testbot/stack/3"
         ),
-        "update PR #1: body (cross-links)",
-        f"update the new PR for {inserted[:8]}: body (cross-links)",
-        "update PR #2: base -> testbot/stack/4, body (cross-links)",
-        "update PR #3: body (cross-links)",
+        "update PR #1: stack comment",
+        f"update the new PR for {inserted[:8]}: stack comment",
+        "update PR #2: base -> testbot/stack/4, stack comment",
+        "update PR #3: stack comment",
     ]
     # #1 is "updated" although its branch stayed put: its cross-links changed.
     assert result_block(out) == [
@@ -583,11 +605,12 @@ def test_inserting_commit_between_a_and_b_relinks_bases(
     ]
     assert [prs[n]["state"] for n in (1, 2, 3, 4)] == ["OPEN"] * 4
     numbers = [1, 4, 2, 3]
-    assert prs[1]["body"] == f"{toc(numbers, 1)}\n\n{DELIMITER}\n\n### Add a"
-    assert prs[4]["body"] == f"{toc(numbers, 4)}\n\n{DELIMITER}\n\n### Add a2"
-    assert prs[2]["body"] == f"{toc(numbers, 2)}\n\n{DELIMITER}\n\n### Add b"
-    assert prs[3]["body"] == f"{toc(numbers, 3)}\n\n{DELIMITER}\n\n### Add c"
-    assert prs[1]["body"].startswith("Stacked PRs:\n * #3\n * #2\n * #4\n * __->__#1\n")
+    assert [prs[n]["body"] for n in numbers] == ["", "", "", ""]
+    for n in numbers:
+        assert fake_gh.stack_comments(n) == [stack_comment(numbers, n)]
+    assert fake_gh.stack_comments(1)[0].endswith(
+        "Stacked PRs:\n * #3\n * #2\n * #4\n * __->__#1"
+    )
 
     shas = work.shas()
     assert shas[0] == a1
@@ -603,10 +626,10 @@ def test_inserting_commit_between_a_and_b_relinks_bases(
     assert identities(work) == identities_before
     branches = work.remote.branches()
     assert [branches[f"testbot/stack/{i}"] for i in (1, 4, 2, 3)] == shas
-    assert fake_gh.calls("pr", "edit")[-2] == [
-        "pr", "edit", "2", "--repo", REPO_SLUG,
-        "--body-file", "-", "--base", "testbot/stack/4",
-    ]  # fmt: skip
+    # The only PR edit is the retarget of #2; the bodies did not change.
+    assert fake_gh.calls("pr", "edit") == [
+        ["pr", "edit", "2", "--repo", REPO_SLUG, "--base", "testbot/stack/4"]
+    ]
     assert fake_gh.calls("pr", "ready") == []
 
 
@@ -687,10 +710,8 @@ def test_plain_export_after_partial_export_adds_pr_for_the_top_commit(
     for n in (1, 2):
         for key in ("title", "headRefName", "baseRefName", "state", "number", "url"):
             assert prs[n][key] == prs_before[n][key]
-    assert (
-        prs[1]["body"]
-        == "Stacked PRs:\n * #3\n * #2\n * __->__#1\n\n--- --- ---\n\n### Add a"
-    )
+    assert prs[1]["body"] == ""
+    assert fake_gh.stack_comments(1) == [stack_comment([1, 2, 3], 1)]
 
     shas = work.shas()
     assert shas[:2] == [a1, b1]
@@ -820,6 +841,8 @@ def test_single_commit_stack_has_plain_body_and_no_edit(
     assert "Stacked PRs:" not in prs[1]["body"]
     assert DELIMITER not in prs[1]["body"]
     assert "edits" not in prs[1]
+    # A stack of one gets no stack comment either.
+    assert fake_gh.comments(1) == []
     assert fake_gh.calls("pr", "edit") == []
     assert len(fake_gh.write_calls()) == 1
     assert work.message() == f"Add a\n\nSome details about a.\n\n{stack_info(1)}"
@@ -880,10 +903,12 @@ def test_reexport_does_not_undraft_existing_draft_prs(
 # --------------------------------------------------------------------------- #
 # 12. --keep-body
 # --------------------------------------------------------------------------- #
-HAND_WRITTEN = "Stacked PRs:\n * #1\n\n--- --- ---\n\nHand written notes"
+HAND_WRITTEN = "Hand written notes"
+# A body written by an older version: stack list, delimiter, title heading.
+LEGACY_BODY = f"Stacked PRs:\n * #1\n\n{DELIMITER}\n\n### Add b\n\n{HAND_WRITTEN}"
 
 
-def test_keep_body_preserves_hand_written_description_and_refreshes_toc(
+def test_keep_body_preserves_hand_written_description_and_refreshes_comment(
     work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
 ) -> None:
     run_export()
@@ -893,14 +918,26 @@ def test_keep_body_preserves_hand_written_description_and_refreshes_toc(
     rc, _out, _err = run_export("--keep-body")
 
     assert rc == 0
-    body = fake_gh.pr(2)["body"]
-    assert body == (
-        "Stacked PRs:\n * #4\n * #3\n * __->__#2\n * #1\n\n--- --- ---\n\n"
-        "### Add b\n\nHand written notes"
-    )
-    assert body.endswith("Hand written notes")
-    assert fake_gh.pr(2)["edits"] == 2
+    assert fake_gh.pr(2)["body"] == HAND_WRITTEN
+    assert "edits" not in fake_gh.pr(2)  # the body was left alone
+    assert fake_gh.stack_comments(2) == [stack_comment([1, 2, 3, 4], 2)]
     assert sorted(fake_gh.prs()) == [1, 2, 3, 4]
+
+
+def test_keep_body_strips_the_stack_list_of_an_older_version_from_the_body(
+    work: Work, fake_gh: FakeGitHub, run_export: RunExport, stack3: list[str]
+) -> None:
+    run_export()
+    fake_gh.set_body(2, LEGACY_BODY)
+    work.commit("d.txt", "Add d")
+
+    rc, out, _err = run_export("--keep-body", "-v")
+
+    assert rc == 0
+    assert "update PR #2: description, stack comment" in out
+    assert fake_gh.pr(2)["body"] == HAND_WRITTEN
+    assert fake_gh.pr(2)["edits"] == 1
+    assert fake_gh.stack_comments(2) == [stack_comment([1, 2, 3, 4], 2)]
 
 
 def test_without_keep_body_the_description_reverts_to_the_commit_message(
@@ -913,10 +950,8 @@ def test_without_keep_body_the_description_reverts_to_the_commit_message(
     rc, _out, _err = run_export()
 
     assert rc == 0
-    assert fake_gh.pr(2)["body"] == (
-        "Stacked PRs:\n * #4\n * #3\n * __->__#2\n * #1\n\n--- --- ---\n\n### Add b"
-    )
-    assert "Hand written notes" not in fake_gh.pr(2)["body"]
+    assert fake_gh.pr(2)["body"] == ""
+    assert fake_gh.stack_comments(2) == [stack_comment([1, 2, 3, 4], 2)]
 
 
 def test_keep_body_does_not_duplicate_generated_title_heading(
@@ -928,9 +963,9 @@ def test_keep_body_does_not_duplicate_generated_title_heading(
     rc, _out, _err = run_export("--keep-body")
 
     assert rc == 0
-    assert fake_gh.pr(1)["body"] == (
-        "Stacked PRs:\n * #4\n * #3\n * #2\n * __->__#1\n\n--- --- ---\n\n### Add a"
-    )
+    assert fake_gh.pr(1)["body"] == ""
+    assert "###" not in fake_gh.pr(1)["body"]
+    assert fake_gh.stack_comments(1) == [stack_comment([1, 2, 3, 4], 1)]
 
 
 # --------------------------------------------------------------------------- #
@@ -1033,9 +1068,8 @@ def test_multi_paragraph_message_keeps_description_and_adds_one_trailer_paragrap
     assert raw_message(work, a_sha) == f"Add a\n\n{description}\n\n{stack_info(1)}\n"
     assert raw_message(work, a_sha).count("\n\n\n") == 0
     assert raw_message(work, a_sha).count("stack-info:") == 1
-    assert fake_gh.pr(1)["body"] == (
-        f"Stacked PRs:\n * #2\n * __->__#1\n\n{DELIMITER}\n\n### Add a\n\n{description}"
-    )
+    assert fake_gh.pr(1)["body"] == description
+    assert fake_gh.stack_comments(1) == [stack_comment([1, 2], 1)]
     assert fake_gh.pr(1)["title"] == "Add a"
     assert "stack-info" not in fake_gh.pr(1)["body"]
 
@@ -1224,7 +1258,7 @@ def test_fresh_export_fetches_main_exactly_once_even_when_already_up_to_date(
     assert calls.count(USER_CALL) == 1
     assert graphql_calls(calls) == []
     assert fake_gh.calls("pr", "view") == []
-    assert [c[:2] for c in calls[1:]] == [["pr", "create"]] * 3 + [["pr", "edit"]] * 3
+    assert [c[:2] for c in calls[1:]] == [["pr", "create"]] * 3 + [COMMENT_CALL] * 3
 
 
 def test_reexport_of_unchanged_stack_makes_exactly_one_batched_pr_lookup(
@@ -1361,7 +1395,7 @@ def test_adding_a_commit_looks_up_the_login_once_and_the_prs_in_one_batch(
     assert new_calls[:2] == [USER_CALL, lookups[0]]
     assert fake_gh.calls("pr", "view") == []
     assert fake_gh.calls("pr", "list") == []
-    assert [c[:2] for c in new_calls[2:]] == [["pr", "create"]] + [["pr", "edit"]] * 4
+    assert [c[:2] for c in new_calls[2:]] == [["pr", "create"]] + [COMMENT_CALL] * 4
     assert result_block(out) == [
         "Exported 4 pull requests (1 new, 3 updated):",
         result_line(4, 4, "new", "Add d"),
@@ -1408,10 +1442,10 @@ def test_branches_pushed_labels_amended_branch_updated_and_new_branch_new(
             "push the stack to origin (--atomic --force-with-lease): "
             "testbot/stack/3, testbot/stack/4"
         ),
-        "update PR #1: body (cross-links)",
-        "update PR #2: body (cross-links)",
-        "update PR #3: body (cross-links)",
-        f"update the new PR for {d[:8]}: body (cross-links)",
+        "update PR #1: stack comment",
+        "update PR #2: stack comment",
+        "update PR #3: stack comment",
+        f"update the new PR for {d[:8]}: stack comment",
     ]
     assert result_block(out) == [
         "Exported 4 pull requests (1 new, 3 updated):",

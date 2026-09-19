@@ -12,17 +12,22 @@ from dataclasses import dataclass, field
 
 from pstack_pr.errors import PstackError
 from pstack_pr.git import Commit
-from pstack_pr.github import PullRequest
+from pstack_pr.github import Comment, PullRequest
 
 # stack-info: PR: https://github.com/owner/repo/pull/30, branch: user/stack/7
 STACK_INFO_RE = re.compile(
     r"^stack-info: PR: (?P<pr>\S+), branch: (?P<branch>\S+)[ \t]*$", re.MULTILINE
 )
 
-# Separates the generated table of contents from the description in a PR body.
-CROSS_LINKS_DELIMITER = "--- --- ---"
+# The list of the stack's pull requests lives in a comment on each PR, not in
+# the body: GitHub copies the body into the squash-merge commit message, and
+# the list would be noise there. The comment is recognised by this first line.
+STACK_COMMENT_MARKER = "<!-- pstack-pr: stack -->"
 TOC_HEADER = "Stacked PRs:"
 TOC_CURRENT_MARKER = "__->__"
+# Older versions put the list at the top of the body, above this delimiter.
+# It is still recognised so that such bodies are cleaned up on the next export.
+CROSS_LINKS_DELIMITER = "--- --- ---"
 # Appended to a PR body while the tool has temporarily converted the PR to a
 # draft, so that an interrupted run can be repaired by the next one.
 TMP_DRAFT_MARKER = "<!-- pstack-pr: temporarily a draft while the stack is pushed -->"
@@ -169,9 +174,9 @@ def toc(numbers: Sequence[int], current: int) -> str:
 def description_from_existing_body(body: str) -> str:
     """The hand-written part of a PR body.
 
-    Everything the tool generates is dropped: the cross-links before the
-    delimiter, the ``### <title>`` heading right after it (it is regenerated
-    from the current commit title) and the temporary-draft marker.
+    Everything the tool ever generated is dropped: the temporary-draft marker
+    and, in bodies written by older versions, the cross-links before the
+    delimiter and the ``### <title>`` heading right after it.
     """
     body = body.replace("\r\n", "\n").replace(TMP_DRAFT_MARKER, "")
     if CROSS_LINKS_DELIMITER not in body:
@@ -184,34 +189,31 @@ def has_tmp_draft_marker(body: str) -> bool:
     return TMP_DRAFT_MARKER in body
 
 
-def pr_body(
-    entry: StackEntry,
-    entries: Sequence[StackEntry],
-    *,
-    existing_body: str | None = None,
-    with_toc: bool = True,
-) -> str:
-    """Body for ``entry``'s pull request.
+def pr_body(entry: StackEntry, *, existing_body: str | None = None) -> str:
+    """Body for ``entry``'s pull request: the commit message minus its title.
 
-    With ``existing_body`` the description part of that body is kept and only
-    the cross-links are regenerated (``--keep-body``). ``with_toc=False`` is
-    used when creating a PR before all PR numbers are known.
+    With ``existing_body`` the description part of that body is kept instead
+    (``--keep-body``); only what the tool itself generated is removed.
     """
-    title, description = title_and_description(entry.commit.message)
     if existing_body is not None:
-        description = description_from_existing_body(existing_body)
+        return description_from_existing_body(existing_body)
+    return title_and_description(entry.commit.message)[1]
 
-    multi = len(entries) > 1
-    if not multi or not with_toc:
-        return description
 
+def stack_comment_body(entry: StackEntry, entries: Sequence[StackEntry]) -> str:
+    """The comment listing the stack's pull requests, as seen from ``entry``."""
     numbers = [e.pr.number for e in entries if e.pr is not None]
     if len(numbers) != len(entries) or entry.pr is None:
-        raise PstackError("internal error: table of contents needs all PR numbers")
-    parts = [toc(numbers, entry.pr.number), CROSS_LINKS_DELIMITER, f"### {title}"]
-    if description:
-        parts.append(description)
-    return "\n\n".join(parts)
+        raise PstackError("internal error: stack comment needs all PR numbers")
+    return f"{STACK_COMMENT_MARKER}\n{toc(numbers, entry.pr.number)}"
+
+
+def find_stack_comment(pr: PullRequest) -> Comment | None:
+    """The comment on ``pr`` maintained by the tool, if it has one."""
+    for comment in pr.comments:
+        if comment.body.replace("\r\n", "\n").lstrip().startswith(STACK_COMMENT_MARKER):
+            return comment
+    return None
 
 
 def pr_title(entry: StackEntry) -> str:

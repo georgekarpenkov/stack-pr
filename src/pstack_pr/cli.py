@@ -91,7 +91,7 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
         "--keep-body",
         action="store_true",
         default=config.keep_body,
-        help="keep existing PR descriptions and only refresh the cross-links",
+        help="keep existing PR descriptions instead of regenerating them from the commit messages",
     )
     export.add_argument(
         "--branch-name-template",

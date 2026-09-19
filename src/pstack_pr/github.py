@@ -6,7 +6,7 @@ import json
 import re
 import shutil
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pstack_pr import shell
 from pstack_pr.errors import PstackError
@@ -21,8 +21,14 @@ _URL_RE = re.compile(
 # GitHub's SSH-over-HTTPS endpoint serves github.com repositories.
 _HOST_ALIASES = {"ssh.github.com": "github.com"}
 
-PR_JSON_FIELDS = "number,url,state,isDraft,title,body,baseRefName,headRefName"
-PR_GRAPHQL_FIELDS = PR_JSON_FIELDS.replace(",", " ")
+PR_JSON_FIELDS = "number,url,state,isDraft,title,body,baseRefName,headRefName,comments"
+# The same fields for GraphQL. Comments are needed to find the stack comment
+# the tool maintains; it is posted right after the PR is created, so it is
+# among the first ones.
+PR_GRAPHQL_FIELDS = (
+    "number url state isDraft title body baseRefName headRefName "
+    "comments(first: 100) { nodes { databaseId url body } }"
+)
 # Pull requests looked up per GraphQL request; well below GitHub's node limits.
 GRAPHQL_BATCH_SIZE = 50
 
@@ -77,6 +83,49 @@ def repo_of_pr_url(url: str) -> Repo | None:
 
 
 @dataclass
+class Comment:
+    """An issue comment on a pull request; ``id`` is the REST (database) id."""
+
+    id: int
+    body: str
+
+    @classmethod
+    def from_json(cls, data: dict[str, object]) -> Comment | None:
+        """``None`` when the id cannot be determined.
+
+        The REST API calls it ``id``; the GraphQL lookup asks for
+        ``databaseId``; ``gh pr view --json comments`` gives the GraphQL node
+        id as ``id`` and the REST id only inside ``url``
+        (``...#issuecomment-<id>``).
+        """
+        comment_id: object = data.get("databaseId")
+        if comment_id is None and isinstance(data.get("id"), int):
+            comment_id = data["id"]
+        if comment_id is None:
+            url = str(data.get("url") or data.get("html_url") or "")
+            m = re.search(r"#issuecomment-(\d+)$", url)
+            comment_id = m.group(1) if m else None
+        if comment_id is None:
+            return None
+        return cls(id=int(str(comment_id)), body=str(data.get("body") or ""))
+
+
+def _comments_from_json(data: object) -> list[Comment]:
+    """Comments from either ``gh --json`` (a list) or GraphQL (``{nodes: []}``)."""
+    if isinstance(data, dict):
+        data = data.get("nodes")
+    if not isinstance(data, list):
+        return []
+    comments = []
+    for item in data:
+        if isinstance(item, dict):
+            comment = Comment.from_json(item)
+            if comment is not None:
+                comments.append(comment)
+    return comments
+
+
+@dataclass
 class PullRequest:
     number: int
     url: str
@@ -86,6 +135,7 @@ class PullRequest:
     body: str
     base: str
     head: str
+    comments: list[Comment] = field(default_factory=list)
 
     @classmethod
     def from_json(cls, data: dict[str, object]) -> PullRequest:
@@ -99,6 +149,7 @@ class PullRequest:
                 body=str(data.get("body") or ""),
                 base=str(data["baseRefName"]),
                 head=str(data["headRefName"]),
+                comments=_comments_from_json(data.get("comments")),
             )
         except KeyError as e:
             raise PstackError(f"unexpected response from gh, missing field {e}") from e
@@ -279,3 +330,25 @@ class GitHub:
         if draft:
             args.append("--undo")
         self._gh(*args)
+
+    def _rest(self, method: str, path: str, payload: dict[str, object]) -> object:
+        """A REST call with a JSON body; ``path`` is relative to the repository."""
+        out = self._gh(
+            "api", "--hostname", self.repo.host, "--method", method,
+            f"repos/{self.repo.owner}/{self.repo.name}/{path}", "--input", "-",
+            input=json.dumps(payload),
+        )  # fmt: skip
+        return json.loads(out or "null")
+
+    def create_comment(self, number: int, body: str) -> Comment:
+        """Post ``body`` as a new comment on pull request ``number``."""
+        data = self._rest("POST", f"issues/{number}/comments", {"body": body})
+        comment = Comment.from_json(data) if isinstance(data, dict) else None
+        if comment is None:
+            raise PstackError(
+                f"'gh api' did not return the comment created on PR #{number}"
+            )
+        return comment
+
+    def edit_comment(self, comment_id: int, body: str) -> None:
+        self._rest("PATCH", f"issues/comments/{comment_id}", {"body": body})

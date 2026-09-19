@@ -17,7 +17,16 @@ import pytest
 
 from pstack_pr.cli import main
 from pstack_pr.stack import TMP_DRAFT_MARKER
-from tests.conftest import FakeGitHub, Remote, RunExport, Work, git
+from tests.conftest import (
+    COMMENT_CALL,
+    FakeGitHub,
+    Remote,
+    RunExport,
+    Work,
+    git,
+    is_write_call,
+    stack_comment,
+)
 
 SLUG = "github.com/octo/widgets"
 PR_URL = "https://github.com/octo/widgets/pull/{}"
@@ -34,8 +43,15 @@ def calls_after(fake_gh: FakeGitHub, start: int) -> list[list[str]]:
 
 
 def write_calls_after(fake_gh: FakeGitHub, start: int) -> list[list[str]]:
-    writes = (["pr", "create"], ["pr", "edit"], ["pr", "ready"], ["pr", "close"])
-    return [c for c in calls_after(fake_gh, start) if c[:2] in writes]
+    return [c for c in calls_after(fake_gh, start) if is_write_call(c)]
+
+
+def comment_call(method: str, path: str) -> list[str]:
+    """The gh api call that creates (POST) or edits (PATCH) a stack comment."""
+    return [
+        "api", "--hostname", "github.com", "--method", method,
+        f"repos/octo/widgets/{path}", "--input", "-",
+    ]  # fmt: skip
 
 
 def n_calls(fake_gh: FakeGitHub) -> int:
@@ -158,8 +174,10 @@ def test_reorder_keeps_all_prs_open_via_transient_retarget(
     assert rc == 0, err
     assert "retarget PR #3 to 'main' during the push, marking it draft meanwhile" in out
     assert "'testbot/stack/2' now sits above it in the stack" in out
+    # At execution time the description also has to lose the temporary-draft
+    # marker written during the retarget.
     assert (
-        "update PR #3: base -> testbot/stack/1, body (cross-links), "
+        "update PR #3: base -> testbot/stack/1, description, stack comment, "
         "mark ready for review again"
     ) in out
 
@@ -176,12 +194,14 @@ def test_reorder_keeps_all_prs_open_via_transient_retarget(
     assert fake_gh.pr(3)["baseRefName"] == BRANCH.format(1)
     assert fake_gh.pr(2)["baseRefName"] == BRANCH.format(3)
     # The transient retarget and draft toggling happened in exactly this order:
-    # everything up to the push first, then the final base/body edits. The
-    # retarget edit also writes the body, which records the temporary draft.
+    # everything up to the push first, then the final base edits and the
+    # refreshed stack comments (ids 1001-1003 were posted by the first export).
+    # The retarget edit also writes the body, which records the temporary
+    # draft; the final edit of #3 removes the marker again.
     assert write_calls_after(fake_gh, start) == [
         ["pr", "ready", "3", "--repo", SLUG, "--undo"],
         ["pr", "edit", "3", "--repo", SLUG, "--body-file", "-", "--base", "main"],
-        ["pr", "edit", "1", "--repo", SLUG, "--body-file", "-"],
+        comment_call("PATCH", "issues/comments/1001"),
         [
             "pr",
             "edit",
@@ -193,18 +213,10 @@ def test_reorder_keeps_all_prs_open_via_transient_retarget(
             "--base",
             BRANCH.format(1),
         ],
+        comment_call("PATCH", "issues/comments/1003"),
         ["pr", "ready", "3", "--repo", SLUG],
-        [
-            "pr",
-            "edit",
-            "2",
-            "--repo",
-            SLUG,
-            "--body-file",
-            "-",
-            "--base",
-            BRANCH.format(3),
-        ],
+        ["pr", "edit", "2", "--repo", SLUG, "--base", BRANCH.format(3)],
+        comment_call("PATCH", "issues/comments/1002"),
     ]
     # Remote branches follow the commits; nothing had to be rewritten locally.
     assert remote.sha(BRANCH.format(3)) == c_sha
@@ -221,10 +233,13 @@ def test_reorder_keeps_all_prs_open_via_transient_retarget(
     assert (
         "Branches pushed: testbot/stack/3 (updated), testbot/stack/2 (updated)\n" in out
     )
-    assert fake_gh.pr(3)["body"].startswith("Stacked PRs:\n * #2\n * __->__#3\n * #1\n")
-    assert fake_gh.pr(2)["body"].startswith("Stacked PRs:\n * __->__#2\n * #3\n * #1\n")
-    # The temporary-draft marker written during the retarget is gone again.
+    assert fake_gh.stack_comments(3) == [stack_comment([1, 3, 2], 3)]
+    assert fake_gh.stack_comments(2) == [stack_comment([1, 3, 2], 2)]
+    assert fake_gh.stack_comments(1) == [stack_comment([1, 3, 2], 1)]
+    # The temporary-draft marker written during the retarget is gone again,
+    # and so is nothing else: the bodies are the (empty) descriptions.
     assert all(TMP_DRAFT_MARKER not in pr["body"] for pr in fake_gh.prs().values())
+    assert [fake_gh.pr(n)["body"] for n in (1, 2, 3)] == ["", "", ""]
 
 
 def test_reorder_of_draft_pr_does_not_toggle_ready_state(
@@ -345,9 +360,9 @@ def test_rerun_after_interrupted_pr_creation_adopts_pushed_branches(
     assert [c[:2] for c in write_calls_after(fake_gh, start)] == [
         ["pr", "create"],
         ["pr", "create"],
-        ["pr", "edit"],
-        ["pr", "edit"],
-        ["pr", "edit"],
+        COMMENT_CALL,
+        COMMENT_CALL,
+        COMMENT_CALL,
     ]
     assert sorted(fake_gh.prs()) == [1, 2, 3]
     assert {n: pr["headRefName"] for n, pr in fake_gh.prs().items()} == {
@@ -473,9 +488,9 @@ def test_recovery_adopts_pushed_branches_known_only_to_the_remote(
         ["pr", "list"],
         ["pr", "create"],
         ["pr", "create"],
-        ["pr", "edit"],
-        ["pr", "edit"],
-        ["pr", "edit"],
+        COMMENT_CALL,
+        COMMENT_CALL,
+        COMMENT_CALL,
     ]
     assert all("graphql" not in c for c in calls)
     assert sorted(fake_gh.prs()) == [1, 2, 3]
@@ -512,13 +527,13 @@ def test_rerun_after_local_update_only_finishes_remote_side(
     assert rc == 0
     a1, b1, c1 = work.shas()
     # Simulate a crash between step 5 and 7: the remote lags behind the local
-    # branch and the PR bodies do not have their cross-links yet.
+    # branch and the PRs do not have their stack comments yet.
     work.git(
         "push", "-q", "--force", "origin", f"{stack3[1]}:refs/heads/{BRANCH.format(2)}"
     )
     assert remote.sha(BRANCH.format(2)) == stack3[1]
     for n in (1, 2, 3):
-        fake_gh.set_body(n, "")
+        fake_gh.remove_comments(n)
     reflog_before = work.reflog("feature")
     start = n_calls(fake_gh)
 
@@ -530,21 +545,17 @@ def test_rerun_after_local_update_only_finishes_remote_side(
     assert (
         "push the stack to origin (--atomic --force-with-lease): testbot/stack/2" in out
     )
-    # Only branch 2 lagged behind; every PR got its cross-links back.
+    # Only branch 2 lagged behind; every PR got its stack comment back.
     assert "Exported 3 pull requests (3 updated):" in out
     assert "Branches pushed: testbot/stack/2 (updated)\n" in out
     assert work.head() == c1
     assert work.shas() == [a1, b1, c1]
     assert work.reflog("feature") == reflog_before
     assert remote.sha(BRANCH.format(2)) == b1
-    assert [c[:3] for c in write_calls_after(fake_gh, start)] == [
-        ["pr", "edit", "1"],
-        ["pr", "edit", "2"],
-        ["pr", "edit", "3"],
+    assert write_calls_after(fake_gh, start) == [
+        comment_call("POST", f"issues/{n}/comments") for n in (1, 2, 3)
     ]
-    assert fake_gh.pr(2)["body"] == (
-        "Stacked PRs:\n * #3\n * __->__#2\n * #1\n\n--- --- ---\n\n### Add b"
-    )
+    assert fake_gh.stack_comments(2) == [stack_comment([1, 2, 3], 2)]
 
 
 # --------------------------------------------------------------------------- #
@@ -1318,9 +1329,8 @@ def test_non_ascii_message_round_trips(
     assert rc == 0, err
     assert f"   2  #2  new        {PR_URL.format(2)}  {title}" in out
     assert fake_gh.pr(2)["title"] == title
-    assert fake_gh.pr(2)["body"] == (
-        f"Stacked PRs:\n * __->__#2\n * #1\n\n--- --- ---\n\n### {title}\n\n{body}"
-    )
+    assert fake_gh.pr(2)["body"] == body
+    assert fake_gh.stack_comments(2) == [stack_comment([1, 2], 2)]
     assert work.message() == f"{title}\n\n{body}\n\n{stack_info(2)}"
     assert work.tree() == tree
     assert work.head() != sha

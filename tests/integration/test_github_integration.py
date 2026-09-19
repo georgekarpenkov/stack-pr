@@ -142,18 +142,13 @@ def pr_number(gh_repo: GhRepo, url: str) -> int:
     return int(m.group(1))
 
 
-def expected_body(
-    numbers: list[int], current: int, title: str, description: str = ""
-) -> str:
-    """The PR body the tool generates for a stack (``numbers`` bottom first)."""
-    lines = ["Stacked PRs:"]
+def expected_comment(numbers: list[int], current: int) -> str:
+    """The stack comment the tool keeps on PR ``current`` (``numbers`` bottom first)."""
+    lines = ["<!-- pstack-pr: stack -->", "Stacked PRs:"]
     for number in reversed(numbers):
         marker = "__->__" if number == current else ""
         lines.append(f" * {marker}#{number}")
-    parts = ["\n".join(lines), "--- --- ---", f"### {title}"]
-    if description:
-        parts.append(description)
-    return "\n\n".join(parts)
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -262,11 +257,12 @@ def test_export_creates_two_stacked_prs(gh_repo: GhRepo, two_commits: Progress) 
     assert (pr2.state, pr2.is_draft, pr2.base, pr2.head) == ("OPEN", False, b1, b2)
     assert (pr1.title, pr2.title) == (title_a, title_b)
     assert (pr1.url, pr2.url) == (url1, url2)
-    assert "Stacked PRs:" in pr1.body
-    assert "Stacked PRs:" in pr2.body
+    # The bodies are the commit descriptions alone; the stack list is a comment.
+    assert normalize(pr1.body) == DESCRIPTION_A
+    assert normalize(pr2.body) == ""
     numbers = [n1, n2]
-    assert normalize(pr1.body) == expected_body(numbers, n1, title_a, DESCRIPTION_A)
-    assert normalize(pr2.body) == expected_body(numbers, n2, title_b)
+    assert gh_repo.stack_comments(n1) == [expected_comment(numbers, n1)]
+    assert gh_repo.stack_comments(n2) == [expected_comment(numbers, n2)]
     assert [pr.number for pr in gh_repo.open_prs()] == sorted(numbers)
 
     progress.shas = shas
@@ -511,9 +507,10 @@ def test_swapping_commits_retargets_prs_without_closing_them(
         f"retarget PR #{n2} to 'main' during the push, marking it draft meanwhile"
         in res.out
     )
-    assert f"update PR #{n1}: base -> {b2}, body (cross-links)" in res.out
+    assert f"update PR #{n1}: base -> {b2}, stack comment" in res.out
     assert (
-        f"update PR #{n2}: body (cross-links), mark ready for review again" in res.out
+        f"update PR #{n2}: description, stack comment, mark ready for review again"
+        in res.out
     )
     # The stack-info lines were still right, so no commit had to be rewritten.
     assert gh_repo.head() == new_a
@@ -537,8 +534,10 @@ def test_swapping_commits_retargets_prs_without_closing_them(
     assert (pr2.state, pr2.is_draft, pr2.base, pr2.head) == ("OPEN", False, "main", b2)
     assert (pr1.state, pr1.is_draft, pr1.base, pr1.head) == ("OPEN", False, b2, b1)
     numbers = [n2, n1]  # bottom first, as the stack now reads
-    assert normalize(pr2.body) == expected_body(numbers, n2, title_b)
-    assert normalize(pr1.body) == expected_body(numbers, n1, title_a, DESCRIPTION_A)
+    assert normalize(pr2.body) == ""
+    assert normalize(pr1.body) == DESCRIPTION_A
+    assert gh_repo.stack_comments(n2) == [expected_comment(numbers, n2)]
+    assert gh_repo.stack_comments(n1) == [expected_comment(numbers, n1)]
     assert [pr.number for pr in gh_repo.open_prs()] == sorted(numbers)
 
     # Several exports and pushes later the branch pushed from the other clone

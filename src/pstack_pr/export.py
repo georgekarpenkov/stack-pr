@@ -17,7 +17,8 @@ Execution order, and why:
    swap ``git update-ref`` transaction. This is the only local write.
 6. Push the rewritten commits to all stack branches (``--atomic``,
    ``--force-with-lease``).
-7. Bring titles, bodies (cross-links) and base branches of the PRs up to date.
+7. Bring titles, bodies and base branches of the PRs up to date, and post or
+   refresh the comment on each PR that lists the whole stack.
 
 If the process is interrupted before step 5 the local repository is untouched;
 re-running adopts the branches pushed in step 2 by their commit sha, so no
@@ -49,10 +50,12 @@ from pstack_pr.stack import (
     StackEntry,
     check_linear,
     check_titles,
+    find_stack_comment,
     has_tmp_draft_marker,
     parse_stack_info,
     pr_body,
     pr_title,
+    stack_comment_body,
     verify_existing_pr,
 )
 from pstack_pr.ui import UI
@@ -220,12 +223,11 @@ class CreatePullRequest(Step):
 
     def run(self) -> None:
         e, opts = self.entry, self.ctx.opts
-        body = pr_body(e, self.ctx.entries, with_toc=False)
         e.pr = self.ctx.gh.create_pr(
             base=e.base,
             head=e.branch,
             title=pr_title(e),
-            body=body,
+            body=pr_body(e),
             draft=opts.draft,
             reviewers=opts.reviewers,
         )
@@ -325,7 +327,7 @@ class PushRewritten(Step):
 
 
 class UpdatePullRequest(Step):
-    """Bring title, body and base of one PR in line with the stack."""
+    """Bring title, body, base and the stack comment of one PR in line."""
 
     def __init__(self, ctx: Context, entry: StackEntry) -> None:
         super().__init__(ctx)
@@ -339,27 +341,40 @@ class UpdatePullRequest(Step):
         e = self.entry
         keep = self.ctx.opts.keep_body and self.existed_before and e.pr is not None
         existing = e.pr.body if keep and e.pr is not None else None
-        return pr_body(e, self.ctx.entries, existing_body=existing)
+        return pr_body(e, existing_body=existing)
+
+    def _wants_comment(self) -> bool:
+        """A stack of one PR gets no comment, but an existing one is kept current."""
+        if len(self.ctx.entries) > 1:
+            return True
+        return (
+            self.entry.pr is not None and find_stack_comment(self.entry.pr) is not None
+        )
 
     def _changes(self) -> dict[str, str | None]:
         """Fields to edit, mapped to their new values (None: not computable yet)."""
         e = self.entry
         changes: dict[str, str | None] = {}
         if e.pr is None:
-            # Not created yet (plan time). The body will need cross-links.
-            if len(self.ctx.entries) > 1:
-                changes["body"] = None
+            # Not created yet (plan time); the body is right from the start.
+            if self._wants_comment():
+                changes["comment"] = None
             return changes
         if pr_title(e) != e.pr.title:
             changes["title"] = pr_title(e)
         if e.base != e.pr.base:
             changes["base"] = e.base
-        if self._all_numbers_known():
-            body = self._desired_body()
-            if _normalize(body) != _normalize(e.pr.body):
-                changes["body"] = body
-        elif len(self.ctx.entries) > 1:
-            changes["body"] = None
+        body = self._desired_body()
+        if _normalize(body) != _normalize(e.pr.body):
+            changes["body"] = body
+        if self._wants_comment():
+            if not self._all_numbers_known():
+                changes["comment"] = None
+            else:
+                comment = find_stack_comment(e.pr)
+                wanted = stack_comment_body(e, self.ctx.entries)
+                if comment is None or _normalize(comment.body) != _normalize(wanted):
+                    changes["comment"] = wanted
         return changes
 
     def describe(self) -> list[str]:
@@ -371,7 +386,9 @@ class UpdatePullRequest(Step):
         if "base" in changes:
             parts.append(f"base -> {changes['base']}")
         if "body" in changes:
-            parts.append("body (cross-links)")
+            parts.append("description")
+        if "comment" in changes:
+            parts.append("stack comment")
         if e.tmp_draft or (e.at_risk and e.pr is not None and not e.pr.is_draft):
             parts.append("mark ready for review again")
         if not parts:
@@ -383,7 +400,7 @@ class UpdatePullRequest(Step):
         e, gh = self.entry, self.ctx.gh
         assert e.pr is not None  # noqa: S101 - all PRs exist by now
         changes = self._changes()
-        if changes:
+        if "title" in changes or "body" in changes or "base" in changes:
             gh.edit_pr(
                 e.pr.number,
                 title=changes.get("title"),
@@ -392,8 +409,18 @@ class UpdatePullRequest(Step):
             )
             e.pr_edited = True
             e.pr.title = changes.get("title") or e.pr.title
-            e.pr.body = changes.get("body") or e.pr.body
             e.pr.base = changes.get("base") or e.pr.base
+            if "body" in changes:
+                e.pr.body = changes["body"] or ""  # may legitimately be empty
+        wanted = changes.get("comment")
+        if wanted is not None:
+            comment = find_stack_comment(e.pr)
+            if comment is None:
+                e.pr.comments.append(gh.create_comment(e.pr.number, wanted))
+            else:
+                gh.edit_comment(comment.id, wanted)
+                comment.body = wanted
+            e.pr_edited = True
         if e.tmp_draft:
             if e.pr.is_draft:
                 gh.set_draft(e.pr.number, draft=False)

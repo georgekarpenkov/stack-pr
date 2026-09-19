@@ -657,7 +657,7 @@ def test_export_verbose_prints_contacting_stack_plan_progress_then_result(
         "   1. push to origin: ",
         "  10. update the new PR for ",
         "\n\n  [1/10] push to origin: ",
-        "  [10/10] update PR #3: body (cross-links)\n",
+        "  [10/10] update PR #3: stack comment\n",
         "\n\n" + STACK3_EXPORTED,
     ]
     assert out.startswith(landmarks[0])
